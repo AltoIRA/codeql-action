@@ -8,7 +8,12 @@ import { Feature } from "./feature-flags";
 import * as initActionPostHelper from "./init-action-post-helper";
 import { getRunnerLogger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
-import { createFeatures, makeVersionInfo, setupTests } from "./testing-utils";
+import {
+  createFeatures,
+  createTestConfig,
+  makeVersionInfo,
+  setupTests,
+} from "./testing-utils";
 import * as uploadLib from "./upload-lib";
 import * as util from "./util";
 import * as workflow from "./workflow";
@@ -38,6 +43,7 @@ test("post: init action with debug mode off", async (t) => {
       uploadDatabaseBundleSpy,
       uploadLogsSpy,
       printDebugLogsSpy,
+      createTestConfig({ debugMode: false }),
       parseRepositoryNwo("github/codeql-action"),
       createFeatures([]),
       getRunnerLogger(true),
@@ -54,16 +60,6 @@ test("post: init action with debug mode on", async (t) => {
     process.env["GITHUB_REPOSITORY"] = "github/codeql-action-fake-repository";
     process.env["RUNNER_TEMP"] = tmpDir;
 
-    const gitHubVersion: util.GitHubVersion = {
-      type: util.GitHubVariant.DOTCOM,
-    };
-    sinon.stub(configUtils, "getConfig").resolves({
-      debugMode: true,
-      gitHubVersion,
-      languages: [],
-      packs: [],
-    } as unknown as configUtils.Config);
-
     const uploadDatabaseBundleSpy = sinon.spy();
     const uploadLogsSpy = sinon.spy();
     const printDebugLogsSpy = sinon.spy();
@@ -72,6 +68,7 @@ test("post: init action with debug mode on", async (t) => {
       uploadDatabaseBundleSpy,
       uploadLogsSpy,
       printDebugLogsSpy,
+      createTestConfig({ debugMode: true }),
       parseRepositoryNwo("github/codeql-action"),
       createFeatures([]),
       getRunnerLogger(true),
@@ -362,7 +359,7 @@ async function testFailedSarifUpload(
 
   const codeqlObject = await codeql.getCodeQLForTesting();
   sinon.stub(codeql, "getCodeQL").resolves(codeqlObject);
-  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.12.0"));
+  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.12.6"));
   const databaseExportDiagnosticsStub = sinon.stub(
     codeqlObject,
     "databaseExportDiagnostics",
@@ -371,8 +368,8 @@ async function testFailedSarifUpload(
 
   sinon.stub(workflow, "getWorkflow").resolves(actionsWorkflow);
 
-  const uploadFromActions = sinon.stub(uploadLib, "uploadFromActions");
-  uploadFromActions.resolves({
+  const uploadFiles = sinon.stub(uploadLib, "uploadFiles");
+  uploadFiles.resolves({
     sarifID: "42",
     statusReport: { raw_upload_size_bytes: 20, zipped_upload_size_bytes: 10 },
   } as uploadLib.UploadResult);
@@ -417,13 +414,14 @@ async function testFailedSarifUpload(
       );
     }
     t.true(
-      uploadFromActions.calledOnceWith(
+      uploadFiles.calledOnceWith(
         sinon.match.string,
         sinon.match.string,
         category,
         sinon.match.any,
+        sinon.match.any,
       ),
-      `Actual args were: ${uploadFromActions.args}`,
+      `Actual args were: ${uploadFiles.args}`,
     );
     t.true(
       waitForProcessing.calledOnceWith(sinon.match.any, "42", sinon.match.any, {
@@ -432,7 +430,7 @@ async function testFailedSarifUpload(
     );
   } else {
     t.true(diagnosticsExportStub.notCalled);
-    t.true(uploadFromActions.notCalled);
+    t.true(uploadFiles.notCalled);
     t.true(waitForProcessing.notCalled);
   }
   return result;

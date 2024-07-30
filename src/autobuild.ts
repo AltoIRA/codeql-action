@@ -4,17 +4,29 @@ import { getTemporaryDirectory, getWorkflowEventName } from "./actions-util";
 import { getGitHubVersion } from "./api-client";
 import { CodeQL, getCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
+import { DocUrl } from "./doc-url";
 import { EnvVar } from "./environment";
 import { Feature, featureConfig, Features } from "./feature-flags";
 import { isTracedLanguage, Language } from "./languages";
 import { Logger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
-import { getRequiredEnvParam } from "./util";
+import { ToolsFeature } from "./tools-features";
+import { BuildMode, getRequiredEnvParam } from "./util";
 
 export async function determineAutobuildLanguages(
+  codeql: CodeQL,
   config: configUtils.Config,
   logger: Logger,
 ): Promise<Language[] | undefined> {
+  if (
+    (config.buildMode === BuildMode.None &&
+      (await codeql.supportsFeature(ToolsFeature.TraceCommandUseBuildMode))) ||
+    config.buildMode === BuildMode.Manual
+  ) {
+    logger.info(`Using ${config.buildMode} build mode, nothing to autobuild.`);
+    return undefined;
+  }
+
   // Attempt to find a language to autobuild
   // We want pick the dominant language in the repo from the ones we're able to build
   // The languages are sorted in order specified by user or by lines of code if we got
@@ -91,19 +103,16 @@ export async function determineAutobuildLanguages(
         .join(
           " and ",
         )}, you must replace the autobuild step of your workflow with custom build steps. ` +
-        "For more information, see " +
-        "https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-the-codeql-workflow-for-compiled-languages#adding-build-steps-for-a-compiled-language",
+        `See ${DocUrl.SPECIFY_BUILD_STEPS_MANUALLY} for more information.`,
     );
   }
 
   return languages;
 }
 
-async function setupCppAutobuild(codeql: CodeQL, logger: Logger) {
+export async function setupCppAutobuild(codeql: CodeQL, logger: Logger) {
   const envVar = featureConfig[Feature.CppDependencyInstallation].envVar;
   const featureName = "C++ automatic installation of dependencies";
-  const envDoc =
-    "https://docs.github.com/en/actions/learn-github-actions/variables#defining-environment-variables-for-a-single-workflow";
   const gitHubVersion = await getGitHubVersion();
   const repositoryNwo = parseRepositoryNwo(
     getRequiredEnvParam("GITHUB_REPOSITORY"),
@@ -123,14 +132,14 @@ async function setupCppAutobuild(codeql: CodeQL, logger: Logger) {
       logger.info(
         `Disabling ${featureName} as we are on a self-hosted runner.${
           getWorkflowEventName() !== "dynamic"
-            ? ` To override this, set the ${envVar} environment variable to 'true' in your workflow (see ${envDoc}).`
+            ? ` To override this, set the ${envVar} environment variable to 'true' in your workflow. See ${DocUrl.DEFINE_ENV_VARIABLES} for more information.`
             : ""
         }`,
       );
       core.exportVariable(envVar, "false");
     } else {
       logger.info(
-        `Enabling ${featureName}. This can be disabled by setting the ${envVar} environment variable to 'false' (see ${envDoc}).`,
+        `Enabling ${featureName}. This can be disabled by setting the ${envVar} environment variable to 'false'. See ${DocUrl.DEFINE_ENV_VARIABLES} for more information.`,
       );
       core.exportVariable(envVar, "true");
     }
@@ -141,8 +150,8 @@ async function setupCppAutobuild(codeql: CodeQL, logger: Logger) {
 }
 
 export async function runAutobuild(
-  language: Language,
   config: configUtils.Config,
+  language: Language,
   logger: Logger,
 ) {
   logger.startGroup(`Attempting to automatically build ${language} code`);
@@ -150,7 +159,14 @@ export async function runAutobuild(
   if (language === Language.cpp) {
     await setupCppAutobuild(codeQL, logger);
   }
-  await codeQL.runAutobuild(language);
+  if (
+    config.buildMode &&
+    (await codeQL.supportsFeature(ToolsFeature.TraceCommandUseBuildMode))
+  ) {
+    await codeQL.extractUsingBuildMode(config, language);
+  } else {
+    await codeQL.runAutobuild(config, language);
+  }
   if (language === Language.go) {
     core.exportVariable(EnvVar.DID_AUTOBUILD_GOLANG, "true");
   }

@@ -6,6 +6,7 @@ import { safeWhich } from "@chrisgavin/safe-which";
 import { v4 as uuidV4 } from "uuid";
 
 import {
+  FileCmdNotFoundError,
   getActionVersion,
   getFileType,
   getOptionalInput,
@@ -15,17 +16,20 @@ import {
 import { getGitHubVersion } from "./api-client";
 import { CodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
-import { EnvVar } from "./environment";
 import {
-  Feature,
-  Features,
-  isPythonDependencyInstallationDisabled,
-} from "./feature-flags";
+  addDiagnostic,
+  flushDiagnostics,
+  logUnwrittenDiagnostics,
+  makeDiagnostic,
+} from "./diagnostics";
+import { EnvVar } from "./environment";
+import { Feature, Features } from "./feature-flags";
 import {
   checkInstallPython311,
+  cleanupDatabaseClusterDirectory,
   initCodeQL,
   initConfig,
-  installPythonDeps,
+  isSipEnabled,
   runInit,
 } from "./init";
 import { Language } from "./languages";
@@ -33,6 +37,7 @@ import { getActionsLogger, Logger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
 import { ToolsSource } from "./setup-codeql";
 import {
+  ActionName,
   StatusReportBase,
   createStatusReportBase,
   getActionsStatus,
@@ -44,7 +49,7 @@ import {
   checkDiskUsage,
   checkForTimeout,
   checkGitHubVersionInRange,
-  codeQlVersionAbove,
+  codeQlVersionAtLeast,
   DEFAULT_DEBUG_ARTIFACT_NAME,
   DEFAULT_DEBUG_DATABASE_NAME,
   getMemoryFlagValue,
@@ -52,7 +57,7 @@ import {
   getThreadsFlagValue,
   initializeEnvironment,
   isHostedRunner,
-  UserError,
+  ConfigurationError,
   wrapError,
   checkActionVersion,
 } from "./util";
@@ -74,12 +79,6 @@ interface InitStatusReport extends StatusReportBase {
 interface InitWithConfigStatusReport extends InitStatusReport {
   /** Comma-separated list of languages where the default queries are disabled. */
   disable_default_queries: string;
-  /**
-   * Comma-separated list of languages that analysis was run for.
-   *
-   * This may be from the workflow file or may be calculated from repository contents
-   */
-  languages: string;
   /** Comma-separated list of paths, from the 'paths' config field. */
   paths: string;
   /** Comma-separated list of paths, from the 'paths-ignore' config field. */
@@ -115,13 +114,19 @@ async function sendCompletedStatusReport(
   error?: Error,
 ) {
   const statusReportBase = await createStatusReportBase(
-    "init",
+    ActionName.Init,
     getActionsStatus(error),
     startedAt,
+    config,
     await checkDiskUsage(logger),
+    logger,
     error?.message,
     error?.stack,
   );
+
+  if (statusReportBase === undefined) {
+    return;
+  }
 
   const workflowLanguages = getOptionalInput("languages");
 
@@ -173,7 +178,6 @@ async function sendCompletedStatusReport(
     const initWithConfigStatusReport: InitWithConfigStatusReport = {
       ...initStatusReport,
       disable_default_queries: disableDefaultQueries,
-      languages,
       paths,
       paths_ignore: pathsIgnore,
       queries: queries.join(","),
@@ -197,7 +201,7 @@ async function run() {
   const logger = getActionsLogger();
   initializeEnvironment(getActionVersion());
 
-  let config: configUtils.Config;
+  let config: configUtils.Config | undefined;
   let codeql: CodeQL;
   let toolsDownloadDurationMs: number | undefined;
   let toolsFeatureFlagsValid: boolean | undefined;
@@ -227,21 +231,20 @@ async function run() {
   );
 
   core.exportVariable(EnvVar.JOB_RUN_UUID, uuidV4());
+  core.exportVariable(EnvVar.INIT_ACTION_HAS_RUN, "true");
 
   try {
-    if (
-      !(await sendStatusReport(
-        await createStatusReportBase(
-          "init",
-          "starting",
-          startedAt,
-          await checkDiskUsage(logger),
-        ),
-      ))
-    ) {
-      return;
+    const statusReportBase = await createStatusReportBase(
+      ActionName.Init,
+      "starting",
+      startedAt,
+      config,
+      await checkDiskUsage(logger),
+      logger,
+    );
+    if (statusReportBase !== undefined) {
+      await sendStatusReport(statusReportBase);
     }
-
     const codeQLDefaultVersionInfo = await features.getDefaultCliVersion(
       gitHubVersion.type,
     );
@@ -265,69 +268,62 @@ async function run() {
     }
     core.endGroup();
 
-    config = await initConfig({
-      languagesInput: getOptionalInput("languages"),
-      queriesInput: getOptionalInput("queries"),
-      packsInput: getOptionalInput("packs"),
-      buildModeInput: getOptionalInput("build-mode"),
-      configFile: getOptionalInput("config-file"),
-      dbLocation: getOptionalInput("db-location"),
-      configInput: getOptionalInput("config"),
-      trapCachingEnabled: getTrapCachingEnabled(),
-      // Debug mode is enabled if:
-      // - The `init` Action is passed `debug: true`.
-      // - Actions step debugging is enabled (e.g. by [enabling debug logging for a rerun](https://docs.github.com/en/actions/managing-workflow-runs/re-running-workflows-and-jobs#re-running-all-the-jobs-in-a-workflow),
-      //   or by setting the `ACTIONS_STEP_DEBUG` secret to `true`).
-      debugMode: getOptionalInput("debug") === "true" || core.isDebug(),
-      debugArtifactName:
-        getOptionalInput("debug-artifact-name") || DEFAULT_DEBUG_ARTIFACT_NAME,
-      debugDatabaseName:
-        getOptionalInput("debug-database-name") || DEFAULT_DEBUG_DATABASE_NAME,
-      repository: repositoryNwo,
-      tempDir: getTemporaryDirectory(),
+    config = await initConfig(
+      {
+        languagesInput: getOptionalInput("languages"),
+        queriesInput: getOptionalInput("queries"),
+        packsInput: getOptionalInput("packs"),
+        buildModeInput: getOptionalInput("build-mode"),
+        configFile: getOptionalInput("config-file"),
+        dbLocation: getOptionalInput("db-location"),
+        configInput: getOptionalInput("config"),
+        trapCachingEnabled: getTrapCachingEnabled(),
+        // Debug mode is enabled if:
+        // - The `init` Action is passed `debug: true`.
+        // - Actions step debugging is enabled (e.g. by [enabling debug logging for a rerun](https://docs.github.com/en/actions/managing-workflow-runs/re-running-workflows-and-jobs#re-running-all-the-jobs-in-a-workflow),
+        //   or by setting the `ACTIONS_STEP_DEBUG` secret to `true`).
+        debugMode: getOptionalInput("debug") === "true" || core.isDebug(),
+        debugArtifactName:
+          getOptionalInput("debug-artifact-name") ||
+          DEFAULT_DEBUG_ARTIFACT_NAME,
+        debugDatabaseName:
+          getOptionalInput("debug-database-name") ||
+          DEFAULT_DEBUG_DATABASE_NAME,
+        repository: repositoryNwo,
+        tempDir: getTemporaryDirectory(),
+        codeql,
+        workspacePath: getRequiredEnvParam("GITHUB_WORKSPACE"),
+        githubVersion: gitHubVersion,
+        apiDetails,
+        features,
+        logger,
+      },
       codeql,
-      workspacePath: getRequiredEnvParam("GITHUB_WORKSPACE"),
-      githubVersion: gitHubVersion,
-      apiDetails,
-      logger,
-    });
+    );
 
     await checkInstallPython311(config.languages, codeql);
-
-    if (
-      config.languages.includes(Language.python) &&
-      getRequiredInput("setup-python-dependencies") === "true"
-    ) {
-      if (await isPythonDependencyInstallationDisabled(codeql, features)) {
-        logger.info("Skipping python dependency installation");
-      } else {
-        try {
-          await installPythonDeps(codeql, logger);
-        } catch (unwrappedError) {
-          const error = wrapError(unwrappedError);
-          logger.warning(
-            `${error.message} You can call this action with 'setup-python-dependencies: false' to disable this process`,
-          );
-        }
-      }
-    }
   } catch (unwrappedError) {
     const error = wrapError(unwrappedError);
     core.setFailed(error.message);
-    await sendStatusReport(
-      await createStatusReportBase(
-        "init",
-        error instanceof UserError ? "user-error" : "aborted",
-        startedAt,
-        await checkDiskUsage(),
-        error.message,
-        error.stack,
-      ),
+    const statusReportBase = await createStatusReportBase(
+      ActionName.Init,
+      error instanceof ConfigurationError ? "user-error" : "aborted",
+      startedAt,
+      config,
+      await checkDiskUsage(),
+      logger,
+      error.message,
+      error.stack,
     );
+    if (statusReportBase !== undefined) {
+      await sendStatusReport(statusReportBase);
+    }
     return;
   }
 
   try {
+    cleanupDatabaseClusterDirectory(config, logger);
+
     // Forward Go flags
     const goFlags = process.env["GOFLAGS"];
     if (goFlags) {
@@ -392,6 +388,27 @@ async function run() {
         logger.warning(
           `Failed to determine the location of the Go binary: ${e}`,
         );
+
+        if (e instanceof FileCmdNotFoundError) {
+          addDiagnostic(
+            config,
+            Language.go,
+            makeDiagnostic(
+              "go/workflow/file-program-unavailable",
+              "The `file` program is required on Linux, but does not appear to be installed",
+              {
+                markdownMessage:
+                  "CodeQL was unable to find the `file` program on this system. Ensure that the `file` program is installed on Linux runners and accessible.",
+                visibility: {
+                  statusPage: true,
+                  telemetry: true,
+                  cliSummaryTable: true,
+                },
+                severity: "warning",
+              },
+            ),
+          );
+        }
       }
     }
 
@@ -418,8 +435,8 @@ async function run() {
     const kotlinLimitVar =
       "CODEQL_EXTRACTOR_KOTLIN_OVERRIDE_MAXIMUM_VERSION_LIMIT";
     if (
-      (await codeQlVersionAbove(codeql, "2.13.4")) &&
-      !(await codeQlVersionAbove(codeql, "2.14.4"))
+      (await codeQlVersionAtLeast(codeql, "2.13.4")) &&
+      !(await codeQlVersionAtLeast(codeql, "2.14.4"))
     ) {
       core.exportVariable(kotlinLimitVar, "1.9.20");
     }
@@ -427,8 +444,8 @@ async function run() {
     if (
       config.languages.includes(Language.java) &&
       // Java Lombok support is enabled by default for >= 2.14.4
-      (await codeQlVersionAbove(codeql, "2.14.0")) &&
-      !(await codeQlVersionAbove(codeql, "2.14.4"))
+      (await codeQlVersionAtLeast(codeql, "2.14.0")) &&
+      !(await codeQlVersionAtLeast(codeql, "2.14.4"))
     ) {
       const envVar = "CODEQL_EXTRACTOR_JAVA_RUN_ANNOTATION_PROCESSORS";
       if (process.env[envVar]) {
@@ -449,7 +466,7 @@ async function run() {
         );
       } else if (
         getTrapCachingEnabled() &&
-        (await features.getValue(Feature.CppTrapCachingEnabled, codeql))
+        (await codeQlVersionAtLeast(codeql, "2.17.5"))
       ) {
         logger.info("Enabling CodeQL C++ TRAP caching support");
         core.exportVariable(envVar, "true");
@@ -459,18 +476,56 @@ async function run() {
       }
     }
 
-    // Disable Python dependency extraction if feature flag set
-    if (await isPythonDependencyInstallationDisabled(codeql, features)) {
+    // For CLI versions <2.15.1, build tracing caused errors in MacOS ARM machines with
+    // System Integrity Protection (SIP) disabled.
+    if (
+      !(await codeQlVersionAtLeast(codeql, "2.15.1")) &&
+      process.platform === "darwin" &&
+      (process.arch === "arm" || process.arch === "arm64") &&
+      !(await isSipEnabled(logger))
+    ) {
+      logger.warning(
+        "CodeQL versions 2.15.0 and lower are not supported on MacOS ARM machines with System Integrity Protection (SIP) disabled.",
+      );
+    }
+
+    // From 2.16.0 the default for the python extractor is to not perform any
+    // dependency extraction. For versions before that, you needed to set this flag to
+    // enable this behavior (supported since 2.13.1).
+
+    if (await codeQlVersionAtLeast(codeql, "2.17.1")) {
+      // disabled by default, no warning
+    } else if (await codeQlVersionAtLeast(codeql, "2.16.0")) {
+      // disabled by default, prints warning if environment variable is not set
+      core.exportVariable(
+        "CODEQL_EXTRACTOR_PYTHON_DISABLE_LIBRARY_EXTRACTION",
+        "true",
+      );
+    } else if (await codeQlVersionAtLeast(codeql, "2.13.1")) {
       core.exportVariable(
         "CODEQL_EXTRACTOR_PYTHON_DISABLE_LIBRARY_EXTRACTION",
         "true",
       );
     } else {
-      // From 2.16.0 the default for the python extractor is to not perform any library
-      // extraction, so we need to set this flag to enable it.
-      core.exportVariable(
-        "CODEQL_EXTRACTOR_PYTHON_FORCE_ENABLE_LIBRARY_EXTRACTION_UNTIL_2_17_0",
-        "true",
+      logger.warning(
+        `CodeQL Action versions 3.25.0 and later, and versions 2.25.0 and later no longer install Python dependencies. We recommend upgrading to at least CodeQL Bundle 2.16.0 to avoid any potential problems due to this (you are currently using ${
+          (await codeql.getVersion()).version
+        }). Alternatively, we recommend downgrading the CodeQL Action to version 3.24.10 (for customers using GitHub.com or GitHub Enterprise Server v3.12 or later) or 2.24.10 (for customers using GitHub Enterprise Server v3.11 or earlier).`,
+      );
+    }
+
+    if (getOptionalInput("setup-python-dependencies") !== undefined) {
+      logger.warning(
+        "The setup-python-dependencies input is deprecated and no longer has any effect. We recommend removing any references from your workflows. See https://github.blog/changelog/2024-01-23-codeql-2-16-python-dependency-installation-disabled-new-queries-and-bug-fixes/ for more information.",
+      );
+    }
+
+    if (
+      process.env["CODEQL_ACTION_DISABLE_PYTHON_DEPENDENCY_INSTALLATION"] !==
+      undefined
+    ) {
+      logger.warning(
+        "The CODEQL_ACTION_DISABLE_PYTHON_DEPENDENCY_INSTALLATION environment variable is deprecated and no longer has any effect. We recommend removing any references from your workflows. See https://github.blog/changelog/2024-01-23-codeql-2-16-python-dependency-installation-disabled-new-queries-and-bug-fixes/ for more information.",
       );
     }
 
@@ -494,7 +549,12 @@ async function run() {
       }
     }
 
+    // Write diagnostics to the database that we previously stored in memory because the database
+    // did not exist until now.
+    flushDiagnostics(config);
+
     core.setOutput("codeql-path", config.codeQLCmd);
+    core.setOutput("codeql-version", (await codeql.getVersion()).version);
   } catch (unwrappedError) {
     const error = wrapError(unwrappedError);
     core.setFailed(error.message);
@@ -509,6 +569,8 @@ async function run() {
       error,
     );
     return;
+  } finally {
+    logUnwrittenDiagnostics();
   }
   await sendCompletedStatusReport(
     startedAt,

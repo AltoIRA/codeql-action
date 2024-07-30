@@ -3,6 +3,7 @@ import path from "path";
 
 import Long from "long";
 
+import { DocUrl } from "./doc-url";
 import { Logger } from "./logging";
 import { SarifFile, SarifResult } from "./util";
 
@@ -259,6 +260,9 @@ export async function addFingerprints(
   sourceRoot: string,
   logger: Logger,
 ): Promise<SarifFile> {
+  logger.info(
+    `Adding fingerprints to SARIF file. See ${DocUrl.TRACK_CODE_SCANNING_ALERTS_ACROSS_RUNS} for more information.`,
+  );
   // Gather together results for the same file and construct
   // callbacks to accept hashes for that file and update the location
   const callbacksByFile: { [filename: string]: hashCallback[] } = {};

@@ -56,8 +56,11 @@ export interface SarifFile {
 export interface SarifRun {
   tool?: {
     driver?: {
+      guid?: string;
       name?: string;
+      fullName?: string;
       semanticVersion?: string;
+      version?: string;
     };
   };
   automationDetails?: {
@@ -117,10 +120,10 @@ export function getExtraOptionsEnvParam(): object {
     return {};
   }
   try {
-    return JSON.parse(raw);
+    return JSON.parse(raw) as object;
   } catch (unwrappedError) {
     const error = wrapError(unwrappedError);
-    throw new UserError(
+    throw new ConfigurationError(
       `${varName} environment variable is set, but does not contain valid JSON: ${error.message}`,
     );
   }
@@ -204,7 +207,9 @@ export function getMemoryFlagValueForPlatform(
   if (userInput) {
     memoryToUseMegaBytes = Number(userInput);
     if (Number.isNaN(memoryToUseMegaBytes) || memoryToUseMegaBytes <= 0) {
-      throw new UserError(`Invalid RAM setting "${userInput}", specified.`);
+      throw new ConfigurationError(
+        `Invalid RAM setting "${userInput}", specified.`,
+      );
     }
   } else {
     const totalMemoryMegaBytes = totalMemoryBytes / (1024 * 1024);
@@ -231,7 +236,7 @@ function getTotalMemoryBytes(logger: Logger): number {
       ]
         .map((file) => getCgroupMemoryLimitBytes(file, logger))
         .filter((limit) => limit !== undefined)
-        .map((limit) => limit as number),
+        .map((limit) => limit),
     );
   }
   const limit = Math.min(...limits);
@@ -373,7 +378,9 @@ export function getThreadsFlagValue(
   if (userInput) {
     numThreads = Number(userInput);
     if (Number.isNaN(numThreads)) {
-      throw new UserError(`Invalid threads setting "${userInput}", specified.`);
+      throw new ConfigurationError(
+        `Invalid threads setting "${userInput}", specified.`,
+      );
     }
     if (numThreads > maxThreads) {
       logger.info(
@@ -436,7 +443,7 @@ function getCgroupCpuCountFromCpuMax(
 /**
  * Gets the number of available cores listed in the cgroup cpuset.cpus file at the given path.
  */
-function getCgroupCpuCountFromCpus(
+export function getCgroupCpuCountFromCpus(
   cpusFile: string,
   logger: Logger,
 ): number | undefined {
@@ -449,7 +456,10 @@ function getCgroupCpuCountFromCpus(
 
   let cpuCount = 0;
   // Comma-separated numbers and ranges, for eg. 0-1,3
-  const cpusString = fs.readFileSync(cpusFile, "utf-8");
+  const cpusString = fs.readFileSync(cpusFile, "utf-8").trim();
+  if (cpusString.length === 0) {
+    return undefined;
+  }
   for (const token of cpusString.split(",")) {
     if (!token.includes("-")) {
       // Not a range
@@ -500,14 +510,14 @@ export function parseGitHubUrl(inputUrl: string): string {
     inputUrl = `https://${inputUrl}`;
   }
   if (!inputUrl.startsWith("http://") && !inputUrl.startsWith("https://")) {
-    throw new UserError(`"${originalUrl}" is not a http or https URL`);
+    throw new ConfigurationError(`"${originalUrl}" is not a http or https URL`);
   }
 
   let url: URL;
   try {
     url = new URL(inputUrl);
   } catch (e) {
-    throw new UserError(`"${originalUrl}" is not a valid URL`);
+    throw new ConfigurationError(`"${originalUrl}" is not a valid URL`);
   }
 
   // If we detect this is trying to be to github.com
@@ -652,7 +662,7 @@ export class HTTPError extends Error {
  * An Error class that indicates an error that occurred due to
  * a misconfiguration of the action or the CodeQL CLI.
  */
-export class UserError extends Error {
+export class ConfigurationError extends Error {
   constructor(message: string) {
     super(message);
   }
@@ -675,7 +685,7 @@ export function getCachedCodeQlVersion(): undefined | VersionInfo {
   return cachedCodeQlVersion;
 }
 
-export async function codeQlVersionAbove(
+export async function codeQlVersionAtLeast(
   codeql: CodeQL,
   requiredVersion: string,
 ): Promise<boolean> {
@@ -725,15 +735,6 @@ export async function delay(
 
 export function isGoodVersion(versionSpec: string) {
   return !BROKEN_VERSIONS.includes(versionSpec);
-}
-
-/**
- * Checks whether the CodeQL CLI supports the `--expect-discarded-cache` command-line flag.
- */
-export async function supportExpectDiscardedCache(
-  codeQL: CodeQL,
-): Promise<boolean> {
-  return codeQlVersionAbove(codeQL, "2.12.1");
 }
 
 /*
@@ -887,7 +888,7 @@ export function parseMatrixInput(
   if (matrixInput === undefined || matrixInput === "null") {
     return undefined;
   }
-  return JSON.parse(matrixInput);
+  return JSON.parse(matrixInput) as { [key: string]: string };
 }
 
 function removeDuplicateLocations(locations: SarifLocation[]): SarifLocation[] {
@@ -1083,4 +1084,19 @@ export function checkActionVersion(
       core.exportVariable("CODEQL_V2_DEPRECATION_WARNING", "true");
     }
   }
+}
+
+/**
+ * Supported build modes.
+ *
+ * These specify whether the CodeQL database should be created by tracing a build, and if so, how
+ * this build will be invoked.
+ */
+export enum BuildMode {
+  /** The database will be created without building the source root. */
+  None = "none",
+  /** The database will be created by attempting to automatically build the source root. */
+  Autobuild = "autobuild",
+  /** The database will be created by building the source root using manually specified build steps. */
+  Manual = "manual",
 }

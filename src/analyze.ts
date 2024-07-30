@@ -2,36 +2,37 @@ import * as fs from "fs";
 import * as path from "path";
 import { performance } from "perf_hooks";
 
-import * as toolrunner from "@actions/exec/lib/toolrunner";
+import { safeWhich } from "@chrisgavin/safe-which";
 import del from "del";
 import * as yaml from "js-yaml";
 
+import { setupCppAutobuild } from "./autobuild";
 import {
   CODEQL_VERSION_ANALYSIS_SUMMARY_V2,
   CodeQL,
   getCodeQL,
 } from "./codeql";
 import * as configUtils from "./config-utils";
-import {
-  FeatureEnablement,
-  Feature,
-  isPythonDependencyInstallationDisabled,
-} from "./feature-flags";
+import { addDiagnostic, makeDiagnostic } from "./diagnostics";
+import { EnvVar } from "./environment";
+import { FeatureEnablement, Feature } from "./feature-flags";
 import { isScannedLanguage, Language } from "./languages";
 import { Logger } from "./logging";
 import { DatabaseCreationTimings, EventReport } from "./status-report";
+import { ToolsFeature } from "./tools-features";
 import { endTracingForCluster } from "./tracer-config";
 import { validateSarifFileSchema } from "./upload-lib";
 import * as util from "./util";
+import { BuildMode } from "./util";
 
 export class CodeQLAnalysisError extends Error {
-  queriesStatusReport: QueriesStatusReport;
-
-  constructor(queriesStatusReport: QueriesStatusReport, message: string) {
+  constructor(
+    public queriesStatusReport: QueriesStatusReport,
+    public message: string,
+    public error: Error,
+  ) {
     super(message);
-
     this.name = "CodeQLAnalysisError";
-    this.queriesStatusReport = queriesStatusReport;
   }
 }
 
@@ -115,75 +116,67 @@ export interface QueriesStatusReport {
   event_reports?: EventReport[];
 }
 
-async function setupPythonExtractor(
-  logger: Logger,
-  features: FeatureEnablement,
-  codeql: CodeQL,
-) {
+async function setupPythonExtractor(logger: Logger) {
   const codeqlPython = process.env["CODEQL_PYTHON"];
   if (codeqlPython === undefined || codeqlPython.length === 0) {
     // If CODEQL_PYTHON is not set, no dependencies were installed, so we don't need to do anything
     return;
   }
 
-  if (await isPythonDependencyInstallationDisabled(codeql, features)) {
-    logger.warning(
-      "We recommend that you remove the CODEQL_PYTHON environment variable from your workflow. This environment variable was originally used to specify a Python executable that included the dependencies of your Python code, however Python analysis no longer uses these dependencies." +
-        "\nIf you used CODEQL_PYTHON to force the version of Python to analyze as, please use CODEQL_EXTRACTOR_PYTHON_ANALYSIS_VERSION instead, such as 'CODEQL_EXTRACTOR_PYTHON_ANALYSIS_VERSION=2.7' or 'CODEQL_EXTRACTOR_PYTHON_ANALYSIS_VERSION=3.11'.",
-    );
-    return;
-  }
-
-  const scriptsFolder = path.resolve(__dirname, "../python-setup");
-
-  let output = "";
-  const options = {
-    listeners: {
-      stdout: (data: Buffer) => {
-        output += data.toString();
-      },
-    },
-  };
-
-  await new toolrunner.ToolRunner(
-    codeqlPython,
-    [path.join(scriptsFolder, "find_site_packages.py")],
-    options,
-  ).exec();
-  logger.info(`Setting LGTM_INDEX_IMPORT_PATH=${output}`);
-  process.env["LGTM_INDEX_IMPORT_PATH"] = output;
-
-  output = "";
-  await new toolrunner.ToolRunner(
-    codeqlPython,
-    ["-c", "import sys; print(sys.version_info[0])"],
-    options,
-  ).exec();
-  logger.info(`Setting LGTM_PYTHON_SETUP_VERSION=${output}`);
-  process.env["LGTM_PYTHON_SETUP_VERSION"] = output;
+  logger.warning(
+    "The CODEQL_PYTHON environment variable is no longer supported. Please remove it from your workflow. This environment variable was originally used to specify a Python executable that included the dependencies of your Python code, however Python analysis no longer uses these dependencies." +
+      "\nIf you used CODEQL_PYTHON to force the version of Python to analyze as, please use CODEQL_EXTRACTOR_PYTHON_ANALYSIS_VERSION instead, such as 'CODEQL_EXTRACTOR_PYTHON_ANALYSIS_VERSION=2.7' or 'CODEQL_EXTRACTOR_PYTHON_ANALYSIS_VERSION=3.11'.",
+  );
+  return;
 }
 
-export async function createdDBForScannedLanguages(
+export async function runExtraction(
   codeql: CodeQL,
   config: configUtils.Config,
   logger: Logger,
-  features: FeatureEnablement,
 ) {
   for (const language of config.languages) {
-    if (
-      isScannedLanguage(language) &&
-      !dbIsFinalized(config, language, logger)
-    ) {
+    if (dbIsFinalized(config, language, logger)) {
+      logger.debug(
+        `Database for ${language} has already been finalized, skipping extraction.`,
+      );
+      continue;
+    }
+
+    if (shouldExtractLanguage(config, language)) {
       logger.startGroup(`Extracting ${language}`);
-
       if (language === Language.python) {
-        await setupPythonExtractor(logger, features, codeql);
+        await setupPythonExtractor(logger);
       }
-
-      await codeql.extractScannedLanguage(config, language);
+      if (
+        config.buildMode &&
+        (await codeql.supportsFeature(ToolsFeature.TraceCommandUseBuildMode))
+      ) {
+        if (
+          language === Language.cpp &&
+          config.buildMode === BuildMode.Autobuild
+        ) {
+          await setupCppAutobuild(codeql, logger);
+        }
+        await codeql.extractUsingBuildMode(config, language);
+      } else {
+        await codeql.extractScannedLanguage(config, language);
+      }
       logger.endGroup();
     }
   }
+}
+
+function shouldExtractLanguage(
+  config: configUtils.Config,
+  language: Language,
+): boolean {
+  return (
+    config.buildMode === BuildMode.None ||
+    (config.buildMode === BuildMode.Autobuild &&
+      process.env[EnvVar.AUTOBUILD_DID_COMPLETE_SUCCESSFULLY] !== "true") ||
+    (!config.buildMode && isScannedLanguage(language))
+  );
 }
 
 export function dbIsFinalized(
@@ -206,16 +199,14 @@ export function dbIsFinalized(
 }
 
 async function finalizeDatabaseCreation(
+  codeql: CodeQL,
   config: configUtils.Config,
   threadsFlag: string,
   memoryFlag: string,
   logger: Logger,
-  features: FeatureEnablement,
 ): Promise<DatabaseCreationTimings> {
-  const codeql = await getCodeQL(config.codeQLCmd);
-
   const extractionStart = performance.now();
-  await createdDBForScannedLanguages(codeql, config, logger, features);
+  await runExtraction(codeql, config, logger);
   const extractionTime = performance.now() - extractionStart;
 
   const trapImportStart = performance.now();
@@ -230,6 +221,7 @@ async function finalizeDatabaseCreation(
         util.getCodeQLDatabasePath(config, language),
         threadsFlag,
         memoryFlag,
+        config.debugMode,
       );
       logger.endGroup();
     }
@@ -269,7 +261,7 @@ export async function runQueries(
       logger.startGroup(`Running queries for ${language}`);
       const startTimeRunQueries = new Date().getTime();
       const databasePath = util.getCodeQLDatabasePath(config, language);
-      await codeql.databaseRunQueries(databasePath, queryFlags, features);
+      await codeql.databaseRunQueries(databasePath, queryFlags);
       logger.debug(`Finished running queries for ${language}.`);
       // TODO should not be using `builtin` here. We should be using `all` instead.
       // The status report does not support `all` yet.
@@ -311,7 +303,7 @@ export async function runQueries(
       }
 
       if (
-        !(await util.codeQlVersionAbove(
+        !(await util.codeQlVersionAtLeast(
           codeql,
           CODEQL_VERSION_ANALYSIS_SUMMARY_V2,
         ))
@@ -323,6 +315,7 @@ export async function runQueries(
       throw new CodeQLAnalysisError(
         statusReport,
         `Error running analysis for ${language}: ${util.wrapError(e).message}`,
+        util.wrapError(e),
       );
     }
   }
@@ -388,9 +381,9 @@ export async function runFinalize(
   outputDir: string,
   threadsFlag: string,
   memoryFlag: string,
+  codeql: CodeQL,
   config: configUtils.Config,
   logger: Logger,
-  features: FeatureEnablement,
 ): Promise<DatabaseCreationTimings> {
   try {
     await del(outputDir, { force: true });
@@ -402,21 +395,63 @@ export async function runFinalize(
   await fs.promises.mkdir(outputDir, { recursive: true });
 
   const timings = await finalizeDatabaseCreation(
+    codeql,
     config,
     threadsFlag,
     memoryFlag,
     logger,
-    features,
   );
 
-  // WARNING: This does not _really_ end tracing, as the tracer will restore its
-  // critical environment variables and it'll still be active for all processes
-  // launched from this build step.
-  // However, it will stop tracing for all steps past the codeql-action/analyze
-  // step.
-  // Delete variables as specified by the end-tracing script
-  await endTracingForCluster(config);
+  // If we didn't already end tracing in the autobuild Action, end it now.
+  if (process.env[EnvVar.AUTOBUILD_DID_COMPLETE_SUCCESSFULLY] !== "true") {
+    await endTracingForCluster(codeql, config, logger);
+  }
   return timings;
+}
+
+export async function warnIfGoInstalledAfterInit(
+  config: configUtils.Config,
+  logger: Logger,
+) {
+  // Check that `which go` still points at the same path it did when the `init` Action ran to ensure that no steps
+  // in-between performed any setup. We encourage users to perform all setup tasks before initializing CodeQL so that
+  // the setup tasks do not interfere with our analysis.
+  // Furthermore, if we installed a wrapper script in the `init` Action, we need to ensure that there isn't a step
+  // in the workflow after the `init` step which installs a different version of Go and takes precedence in the PATH,
+  // thus potentially circumventing our workaround that allows tracing to work.
+  const goInitPath = process.env[EnvVar.GO_BINARY_LOCATION];
+
+  if (
+    process.env[EnvVar.DID_AUTOBUILD_GOLANG] !== "true" &&
+    goInitPath !== undefined
+  ) {
+    const goBinaryPath = await safeWhich("go");
+
+    if (goInitPath !== goBinaryPath) {
+      logger.warning(
+        `Expected \`which go\` to return ${goInitPath}, but got ${goBinaryPath}: please ensure that the correct version of Go is installed before the \`codeql-action/init\` Action is used.`,
+      );
+
+      addDiagnostic(
+        config,
+        Language.go,
+        makeDiagnostic(
+          "go/workflow/go-installed-after-codeql-init",
+          "Go was installed after the `codeql-action/init` Action was run",
+          {
+            markdownMessage:
+              "To avoid interfering with the CodeQL analysis, perform all installation steps before calling the `github/codeql-action/init` Action.",
+            visibility: {
+              statusPage: true,
+              telemetry: true,
+              cliSummaryTable: true,
+            },
+            severity: "warning",
+          },
+        ),
+      );
+    }
+  }
 }
 
 export async function runCleanup(

@@ -8,6 +8,15 @@ export enum EnvVar {
   /** Whether the `analyze` Action completes successfully. */
   ANALYZE_DID_COMPLETE_SUCCESSFULLY = "CODEQL_ACTION_ANALYZE_DID_COMPLETE_SUCCESSFULLY",
 
+  /** Whether the `autobuild` Action completes successfully. */
+  AUTOBUILD_DID_COMPLETE_SUCCESSFULLY = "CODEQL_ACTION_AUTOBUILD_DID_COMPLETE_SUCCESSFULLY",
+
+  /**
+   * The verbosity level of the CLI. One of the following: `errors`, `warnings`, `progress`,
+   * `progress+`, `progress++`, `progress+++`.
+   */
+  CLI_VERBOSITY = "CODEQL_VERBOSITY",
+
   /** Whether the CodeQL Action has invoked the Go autobuilder. */
   DID_AUTOBUILD_GOLANG = "CODEQL_ACTION_DID_AUTOBUILD_GOLANG",
 
@@ -37,6 +46,9 @@ export enum EnvVar {
 
   /** Whether the CodeQL Action has already warned the user about low disk space. */
   HAS_WARNED_ABOUT_DISK_SPACE = "CODEQL_ACTION_HAS_WARNED_ABOUT_DISK_SPACE",
+
+  /** Whether the init action has been run. */
+  INIT_ACTION_HAS_RUN = "CODEQL_ACTION_INIT_HAS_RUN",
 
   /** UUID representing the current job run. */
   JOB_RUN_UUID = "JOB_RUN_UUID",

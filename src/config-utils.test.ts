@@ -14,19 +14,24 @@ import {
   setCodeQL,
 } from "./codeql";
 import * as configUtils from "./config-utils";
+import { Feature } from "./feature-flags";
 import { Language } from "./languages";
 import { getRunnerLogger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
 import {
   setupTests,
   mockLanguagesInRepo as mockLanguagesInRepo,
+  createFeatures,
+  getRecordingLogger,
+  LoggedMessage,
 } from "./testing-utils";
 import {
   GitHubVariant,
   GitHubVersion,
   prettyPrintPack,
-  UserError,
+  ConfigurationError,
   withTmpDir,
+  BuildMode,
 } from "./util";
 
 setupTests(test);
@@ -62,6 +67,7 @@ function createTestInitConfigInputs(
         apiURL: undefined,
         registriesAuthTokens: undefined,
       },
+      features: createFeatures([]),
       logger: getRunnerLogger(true),
     },
     overrides,
@@ -75,7 +81,7 @@ function createConfigFile(inputFileContents: string, tmpDir: string): string {
   return configFilePath;
 }
 
-type GetContentsResponse = { content?: string } | Array<{}>;
+type GetContentsResponse = { content?: string } | object[];
 
 function mockGetContents(
   content: GetContentsResponse,
@@ -218,7 +224,7 @@ test("load input outside of workspace", async (t) => {
     } catch (err) {
       t.deepEqual(
         err,
-        new UserError(
+        new ConfigurationError(
           configUtils.getConfigFileOutsideWorkspaceErrorMessage(
             path.join(tempDir, "../input"),
           ),
@@ -246,7 +252,7 @@ test("load non-local input with invalid repo syntax", async (t) => {
     } catch (err) {
       t.deepEqual(
         err,
-        new UserError(
+        new ConfigurationError(
           configUtils.getConfigFileRepoFormatInvalidMessage(
             "octo-org/codeql-config@main",
           ),
@@ -276,7 +282,7 @@ test("load non-existent input", async (t) => {
     } catch (err) {
       t.deepEqual(
         err,
-        new UserError(
+        new ConfigurationError(
           configUtils.getConfigFileDoesNotExistErrorMessage(
             path.join(tempDir, "input"),
           ),
@@ -323,7 +329,7 @@ test("load non-empty input", async (t) => {
     // And the config we expect it to parse to
     const expectedConfig: configUtils.Config = {
       languages: [Language.javascript],
-      buildMode: "none",
+      buildMode: BuildMode.None,
       originalUserInput: {
         name: "my config",
         "disable-default-queries": true,
@@ -516,7 +522,7 @@ test("Remote config handles the case where a directory is provided", async (t) =
     } catch (err) {
       t.deepEqual(
         err,
-        new UserError(
+        new ConfigurationError(
           configUtils.getConfigFileDirectoryGivenMessage(repoReference),
         ),
       );
@@ -545,7 +551,7 @@ test("Invalid format of remote config handled correctly", async (t) => {
     } catch (err) {
       t.deepEqual(
         err,
-        new UserError(
+        new ConfigurationError(
           configUtils.getConfigFileFormatInvalidMessage(repoReference),
         ),
       );
@@ -575,7 +581,10 @@ test("No detected languages", async (t) => {
       );
       throw new Error("initConfig did not throw error");
     } catch (err) {
-      t.deepEqual(err, new UserError(configUtils.getNoLanguagesError()));
+      t.deepEqual(
+        err,
+        new ConfigurationError(configUtils.getNoLanguagesError()),
+      );
     }
   });
 });
@@ -597,7 +606,7 @@ test("Unknown languages", async (t) => {
     } catch (err) {
       t.deepEqual(
         err,
-        new UserError(
+        new ConfigurationError(
           configUtils.getUnknownLanguagesError(["rubbish", "english"]),
         ),
       );
@@ -1076,3 +1085,57 @@ const mockRepositoryNwo = parseRepositoryNwo("owner/repo");
     t.deepEqual(mockRequest.called, args.expectedApiCall);
   });
 });
+
+for (const { displayName, language, feature } of [
+  {
+    displayName: "Java",
+    language: Language.java,
+    feature: Feature.DisableJavaBuildlessEnabled,
+  },
+  {
+    displayName: "C#",
+    language: Language.csharp,
+    feature: Feature.DisableCsharpBuildless,
+  },
+]) {
+  test(`Build mode not overridden when disable ${displayName} buildless feature flag disabled`, async (t) => {
+    const messages: LoggedMessage[] = [];
+    const buildMode = await configUtils.parseBuildModeInput(
+      "none",
+      [language],
+      createFeatures([]),
+      getRecordingLogger(messages),
+    );
+    t.is(buildMode, BuildMode.None);
+    t.deepEqual(messages, []);
+  });
+
+  test(`Build mode not overridden for other languages when disable ${displayName} buildless feature flag enabled`, async (t) => {
+    const messages: LoggedMessage[] = [];
+    const buildMode = await configUtils.parseBuildModeInput(
+      "none",
+      [Language.python],
+      createFeatures([feature]),
+      getRecordingLogger(messages),
+    );
+    t.is(buildMode, BuildMode.None);
+    t.deepEqual(messages, []);
+  });
+
+  test(`Build mode overridden when analyzing ${displayName} and disable ${displayName} buildless feature flag enabled`, async (t) => {
+    const messages: LoggedMessage[] = [];
+    const buildMode = await configUtils.parseBuildModeInput(
+      "none",
+      [language],
+      createFeatures([feature]),
+      getRecordingLogger(messages),
+    );
+    t.is(buildMode, BuildMode.Autobuild);
+    t.deepEqual(messages, [
+      {
+        message: `Scanning ${displayName} code without a build is temporarily unavailable. Falling back to 'autobuild' build mode.`,
+        type: "warning",
+      },
+    ]);
+  });
+}

@@ -1,10 +1,12 @@
+import * as fs from "fs";
+
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 
 import * as actionsUtil from "./actions-util";
 import { getApiClient } from "./api-client";
 import { getCodeQL } from "./codeql";
-import { Config, getConfig } from "./config-utils";
+import { Config } from "./config-utils";
 import { EnvVar } from "./environment";
 import { Feature, FeatureEnablement } from "./feature-flags";
 import { Logger } from "./logging";
@@ -102,12 +104,12 @@ async function maybeUploadFailedSarif(
   }
 
   logger.info(`Uploading failed SARIF file ${sarifFile}`);
-  const uploadResult = await uploadLib.uploadFromActions(
+  const uploadResult = await uploadLib.uploadFiles(
     sarifFile,
     checkoutPath,
     category,
+    features,
     logger,
-    { considerInvalidRequestUserError: false },
   );
   await uploadLib.waitForProcessing(
     repositoryNwo,
@@ -134,7 +136,7 @@ export async function tryUploadSarifIfRunFailed(
     // consider this a configuration error.
     core.exportVariable(
       EnvVar.JOB_STATUS,
-      process.env[EnvVar.JOB_STATUS] ?? JobStatus.ConfigurationError,
+      process.env[EnvVar.JOB_STATUS] ?? JobStatus.ConfigErrorStatus,
     );
     try {
       return await maybeUploadFailedSarif(
@@ -152,7 +154,7 @@ export async function tryUploadSarifIfRunFailed(
   } else {
     core.exportVariable(
       EnvVar.JOB_STATUS,
-      process.env[EnvVar.JOB_STATUS] ?? JobStatus.Success,
+      process.env[EnvVar.JOB_STATUS] ?? JobStatus.SuccessStatus,
     );
     return {
       upload_failed_run_skipped_because:
@@ -162,21 +164,17 @@ export async function tryUploadSarifIfRunFailed(
 }
 
 export async function run(
-  uploadDatabaseBundleDebugArtifact: Function,
-  uploadLogsDebugArtifact: Function,
-  printDebugLogs: Function,
+  uploadDatabaseBundleDebugArtifact: (
+    config: Config,
+    logger: Logger,
+  ) => Promise<void>,
+  uploadLogsDebugArtifact: (config: Config) => Promise<void>,
+  printDebugLogs: (config: Config) => Promise<void>,
+  config: Config,
   repositoryNwo: RepositoryNwo,
   features: FeatureEnablement,
   logger: Logger,
 ) {
-  const config = await getConfig(actionsUtil.getTemporaryDirectory(), logger);
-  if (config === undefined) {
-    logger.warning(
-      "Debugging artifacts are unavailable since the 'init' Action failed before it could produce any.",
-    );
-    return;
-  }
-
   const uploadFailedSarifResult = await tryUploadSarifIfRunFailed(
     config,
     repositoryNwo,
@@ -223,6 +221,28 @@ export async function run(
     await uploadLogsDebugArtifact(config);
 
     await printDebugLogs(config);
+  }
+
+  if (actionsUtil.isSelfHostedRunner()) {
+    try {
+      fs.rmSync(config.dbLocation, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+      });
+      logger.info(
+        `Cleaned up database cluster directory ${config.dbLocation}.`,
+      );
+    } catch (e) {
+      logger.warning(
+        `Failed to clean up database cluster directory ${config.dbLocation}. Details: ${e}`,
+      );
+    }
+  } else {
+    logger.debug(
+      "Skipping cleanup of database cluster directory since we are running on a GitHub-hosted " +
+        "runner which will be automatically cleaned up.",
+    );
   }
 
   return uploadFailedSarifResult;
@@ -314,7 +334,7 @@ export function getFinalJobStatus(): JobStatus {
     !jobStatusFromEnvironment ||
     !Object.values(JobStatus).includes(jobStatusFromEnvironment as JobStatus)
   ) {
-    return JobStatus.Unknown;
+    return JobStatus.UnknownStatus;
   }
   return jobStatusFromEnvironment as JobStatus;
 }

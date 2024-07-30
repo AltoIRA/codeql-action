@@ -1,7 +1,7 @@
 name: "Build mode none"
 description: "An end-to-end integration test of a Java repository built using 'build-mode: none'"
 operatingSystems: ["ubuntu"]
-versions: ["latest", "nightly-latest"]
+versions: ["linked", "nightly-latest"]
 steps:
   - uses: ./../action/init
     id: init
@@ -20,5 +20,8 @@ steps:
         exit 1
       fi
 
+  # The latest nightly supports omitting the autobuild Action when the build mode is specified.
   - uses: ./../action/autobuild
+    if: matrix.version != 'nightly-latest'
+
   - uses: ./../action/analyze

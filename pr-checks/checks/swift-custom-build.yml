@@ -1,7 +1,7 @@
 name: "Swift analysis using a custom build command"
 description: "Tests creation of a Swift database using custom build"
-versions: ["latest", "default", "nightly-latest"]
-operatingSystems: ["ubuntu", "macos"]
+versions: ["linked", "default", "nightly-latest"]
+operatingSystems: ["macos", "ubuntu"]
 env:
   DOTNET_GENERATE_ASPNET_CERTIFICATE: "false"
 steps:
