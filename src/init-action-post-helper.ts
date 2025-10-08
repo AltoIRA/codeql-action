@@ -4,21 +4,23 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 
 import * as actionsUtil from "./actions-util";
+import { CodeScanning } from "./analyses";
 import { getApiClient } from "./api-client";
-import { getCodeQL } from "./codeql";
+import { CodeQL, getCodeQL } from "./codeql";
 import { Config } from "./config-utils";
+import * as dependencyCaching from "./dependency-caching";
 import { EnvVar } from "./environment";
 import { Feature, FeatureEnablement } from "./feature-flags";
 import { Logger } from "./logging";
-import { RepositoryNwo, parseRepositoryNwo } from "./repository";
+import { RepositoryNwo, getRepositoryNwo } from "./repository";
 import { JobStatus } from "./status-report";
 import * as uploadLib from "./upload-lib";
 import {
   delay,
   getErrorMessage,
   getRequiredEnvParam,
-  isInTestMode,
   parseMatrixInput,
+  shouldSkipSarifUpload,
   wrapError,
 } from "./util";
 import {
@@ -42,6 +44,10 @@ export interface UploadFailedSarifResult extends uploadLib.UploadStatusReport {
 
 export interface JobStatusReport {
   job_status: JobStatus;
+}
+
+export interface DependencyCachingUsageReport {
+  dependency_caching_usage?: dependencyCaching.DependencyCachingUsageReport;
 }
 
 function createFailedUploadFailedSarifResult(
@@ -75,7 +81,7 @@ async function maybeUploadFailedSarif(
     !["always", "failure-only"].includes(
       actionsUtil.getUploadValue(shouldUpload),
     ) ||
-    isInTestMode()
+    shouldSkipSarifUpload()
   ) {
     return { upload_failed_run_skipped_because: "SARIF upload is disabled" };
   }
@@ -94,13 +100,7 @@ async function maybeUploadFailedSarif(
     await codeql.diagnosticsExport(sarifFile, category, config);
   } else {
     // We call 'database export-diagnostics' to find any per-database diagnostics.
-    await codeql.databaseExportDiagnostics(
-      databasePath,
-      sarifFile,
-      category,
-      config.tempDir,
-      logger,
-    );
+    await codeql.databaseExportDiagnostics(databasePath, sarifFile, category);
   }
 
   logger.info(`Uploading failed SARIF file ${sarifFile}`);
@@ -110,6 +110,7 @@ async function maybeUploadFailedSarif(
     category,
     features,
     logger,
+    CodeScanning,
   );
   await uploadLib.waitForProcessing(
     repositoryNwo,
@@ -164,12 +165,14 @@ export async function tryUploadSarifIfRunFailed(
 }
 
 export async function run(
-  uploadDatabaseBundleDebugArtifact: (
+  uploadAllAvailableDebugArtifacts: (
+    codeql: CodeQL,
     config: Config,
     logger: Logger,
+    codeQlVersion: string,
   ) => Promise<void>,
-  uploadLogsDebugArtifact: (config: Config) => Promise<void>,
   printDebugLogs: (config: Config) => Promise<void>,
+  codeql: CodeQL,
   config: Config,
   repositoryNwo: RepositoryNwo,
   features: FeatureEnablement,
@@ -217,9 +220,13 @@ export async function run(
     logger.info(
       "Debug mode is on. Uploading available database bundles and logs as Actions debugging artifacts...",
     );
-    await uploadDatabaseBundleDebugArtifact(config, logger);
-    await uploadLogsDebugArtifact(config);
-
+    const version = await codeql.getVersion();
+    await uploadAllAvailableDebugArtifacts(
+      codeql,
+      config,
+      logger,
+      version.version,
+    );
     await printDebugLogs(config);
   }
 
@@ -261,9 +268,7 @@ async function removeUploadedSarif(
     const client = getApiClient();
 
     try {
-      const repositoryNwo = parseRepositoryNwo(
-        getRequiredEnvParam("GITHUB_REPOSITORY"),
-      );
+      const repositoryNwo = getRepositoryNwo();
 
       // Wait to make sure the analysis is ready for download before requesting it.
       await delay(5000);

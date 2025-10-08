@@ -3,51 +3,48 @@ import * as path from "path";
 import { performance } from "perf_hooks";
 
 import * as yaml from "js-yaml";
-import * as semver from "semver";
 
+import { getActionVersion, isAnalyzingPullRequest } from "./actions-util";
+import {
+  AnalysisConfig,
+  AnalysisKind,
+  CodeQuality,
+  codeQualityQueries,
+  CodeScanning,
+  parseAnalysisKinds,
+} from "./analyses";
 import * as api from "./api-client";
-import { CodeQL, CODEQL_VERSION_LANGUAGE_ALIASING } from "./codeql";
+import { CachingKind, getCachingKind } from "./caching-utils";
+import { type CodeQL } from "./codeql";
+import {
+  calculateAugmentation,
+  ExcludeQueryFilter,
+  generateCodeScanningConfig,
+  UserConfig,
+} from "./config/db-config";
+import { shouldPerformDiffInformedAnalysis } from "./diff-informed-analysis-utils";
+import * as errorMessages from "./error-messages";
 import { Feature, FeatureEnablement } from "./feature-flags";
-import { Language, parseLanguage } from "./languages";
+import { RepositoryProperties } from "./feature-flags/properties";
+import { getGitRoot, isAnalyzingDefaultBranch } from "./git-utils";
+import { KnownLanguage, Language } from "./languages";
 import { Logger } from "./logging";
+import {
+  CODEQL_OVERLAY_MINIMUM_VERSION,
+  OverlayDatabaseMode,
+} from "./overlay-database-utils";
 import { RepositoryNwo } from "./repository";
 import { downloadTrapCaches } from "./trap-caching";
 import {
-  codeQlVersionAtLeast,
   GitHubVersion,
-  prettyPrintPack,
   ConfigurationError,
   BuildMode,
+  codeQlVersionAtLeast,
+  cloneObject,
+  isDefined,
 } from "./util";
 
-// Property names from the user-supplied config file.
-
-const PACKS_PROPERTY = "packs";
-
-/**
- * Format of the config file supplied by the user.
- */
-export interface UserConfig {
-  name?: string;
-  "disable-default-queries"?: boolean;
-  queries?: Array<{
-    name?: string;
-    uses: string;
-  }>;
-  "paths-ignore"?: string[];
-  paths?: string[];
-
-  // If this is a multi-language analysis, then the packages must be split by
-  // language. If this is a single language analysis, then no split by
-  // language is necessary.
-  packs?: Record<string, string[]> | string[];
-
-  // Set of query filters to include and exclude extra queries based on
-  // codeql query suite `include` and `exclude` properties
-  "query-filters"?: QueryFilter[];
-}
-
-export type QueryFilter = ExcludeQueryFilter | IncludeQueryFilter;
+export * from "./config/db-config";
 
 export type RegistryConfigWithCredentials = RegistryConfigNoCredentials & {
   // Token to use when downloading packs from this registry.
@@ -64,20 +61,26 @@ export interface RegistryConfigNoCredentials {
 
   // List of globs that determine which packs are associated with this registry.
   packages: string[] | string;
-}
 
-interface ExcludeQueryFilter {
-  exclude: Record<string, string[] | string>;
-}
-
-interface IncludeQueryFilter {
-  include: Record<string, string[] | string>;
+  // Kind of registry, either "github" or "docker". Default is "docker".
+  // "docker" refers specifically to the GitHub Container Registry, which is the usual way of sharing CodeQL packs.
+  // "github" refers to packs published as content in a GitHub repository. This kind of registry is used in scenarios
+  // where GHCR is not available, such as certain GHES environments.
+  kind?: "github" | "docker";
 }
 
 /**
  * Format of the parsed config file.
  */
 export interface Config {
+  /**
+   * The version of the CodeQL Action that the configuration is for.
+   */
+  version: string;
+  /**
+   * Set of analysis kinds that are enabled.
+   */
+  analysisKinds: AnalysisKind[];
   /**
    * Set of languages to run analysis for.
    */
@@ -124,163 +127,145 @@ export interface Config {
    * Specifies the name of the database in the debugging artifact.
    */
   debugDatabaseName: string;
-
-  augmentationProperties: AugmentationProperties;
+  /**
+   * The configuration we computed by combining `originalUserInput` with `augmentationProperties`,
+   * as well as adjustments made to it based on unsupported or required options.
+   */
+  computedConfig: UserConfig;
 
   /**
    * Partial map from languages to locations of TRAP caches for that language.
    * If a key is omitted, then TRAP caching should not be used for that language.
    */
-  trapCaches: Partial<Record<Language, string>>;
+  trapCaches: { [language: Language]: string };
 
   /**
    * Time taken to download TRAP caches. Used for status reporting.
    */
   trapCacheDownloadTime: number;
-}
 
-/**
- * Describes how to augment the user config with inputs from the action.
- *
- * When running a CodeQL analysis, the user can supply a config file. When
- * running a CodeQL analysis from a GitHub action, the user can supply a
- * config file _and_ a set of inputs.
- *
- * The inputs from the action are used to augment the user config before
- * passing the user config to the CodeQL CLI invocation.
- */
-export interface AugmentationProperties {
-  /**
-   * Whether or not the queries input combines with the queries in the config.
-   */
-  queriesInputCombines: boolean;
+  /** A value indicating how dependency caching should be used. */
+  dependencyCachingEnabled: CachingKind;
 
   /**
-   * The queries input from the `with` block of the action declaration
+   * Extra query exclusions to append to the config.
    */
-  queriesInput?: Array<{ uses: string }>;
+  extraQueryExclusions: ExcludeQueryFilter[];
 
   /**
-   * Whether or not the packs input combines with the packs in the config.
+   * The overlay database mode to use.
    */
-  packsInputCombines: boolean;
+  overlayDatabaseMode: OverlayDatabaseMode;
+
   /**
-   * The packs input from the `with` block of the action declaration
+   * Whether to use caching for overlay databases. If it is true, the action
+   * will upload the created overlay-base database to the actions cache, and
+   * download an overlay-base database from the actions cache before it creates
+   * a new overlay database. If it is false, the action assumes that the
+   * workflow will be responsible for managing database storage and retrieval.
+   *
+   * This property has no effect unless `overlayDatabaseMode` is `Overlay` or
+   * `OverlayBase`.
    */
-  packsInput?: string[];
+  useOverlayDatabaseCaching: boolean;
+
+  /**
+   * A partial mapping from repository properties that affect us to their values.
+   */
+  repositoryProperties: RepositoryProperties;
 }
 
-/**
- * The default, empty augmentation properties. This is most useful
- * for tests.
- */
-export const defaultAugmentationProperties: AugmentationProperties = {
-  queriesInputCombines: false,
-  packsInputCombines: false,
-  packsInput: undefined,
-  queriesInput: undefined,
-};
-export type Packs = Partial<Record<Language, string[]>>;
-
-export interface Pack {
-  name: string;
-  version?: string;
-  path?: string;
-}
-
-export function getPacksStrInvalid(
-  packStr: string,
-  configFile?: string,
-): string {
-  return configFile
-    ? getConfigFilePropertyError(
-        configFile,
-        PACKS_PROPERTY,
-        `"${packStr}" is not a valid pack`,
-      )
-    : `"${packStr}" is not a valid pack`;
-}
-
-export function getConfigFileOutsideWorkspaceErrorMessage(
-  configFile: string,
-): string {
-  return `The configuration file "${configFile}" is outside of the workspace`;
-}
-
-export function getConfigFileDoesNotExistErrorMessage(
-  configFile: string,
-): string {
-  return `The configuration file "${configFile}" does not exist`;
-}
-
-export function getConfigFileRepoFormatInvalidMessage(
-  configFile: string,
-): string {
-  let error = `The configuration file "${configFile}" is not a supported remote file reference.`;
-  error += " Expected format <owner>/<repository>/<file-path>@<ref>";
-
-  return error;
-}
-
-export function getConfigFileFormatInvalidMessage(configFile: string): string {
-  return `The configuration file "${configFile}" could not be read`;
-}
-
-export function getConfigFileDirectoryGivenMessage(configFile: string): string {
-  return `The configuration file "${configFile}" looks like a directory, not a file`;
-}
-
-function getConfigFilePropertyError(
-  configFile: string | undefined,
-  property: string,
-  error: string,
-): string {
-  if (configFile === undefined) {
-    return `The workflow property "${property}" is invalid: ${error}`;
-  } else {
-    return `The configuration file "${configFile}" is invalid: property "${property}" ${error}`;
+export async function getSupportedLanguageMap(
+  codeql: CodeQL,
+  features: FeatureEnablement,
+  logger: Logger,
+): Promise<Record<string, string>> {
+  const resolveSupportedLanguagesUsingCli = await features.getValue(
+    Feature.ResolveSupportedLanguagesUsingCli,
+    codeql,
+  );
+  const resolveResult = await codeql.betterResolveLanguages({
+    filterToLanguagesWithQueries: resolveSupportedLanguagesUsingCli,
+  });
+  if (resolveSupportedLanguagesUsingCli) {
+    logger.debug(
+      `The CodeQL CLI supports the following languages: ${Object.keys(resolveResult.extractors).join(", ")}`,
+    );
   }
+  const supportedLanguages: Record<string, string> = {};
+  // Populate canonical language names
+  for (const extractor of Object.keys(resolveResult.extractors)) {
+    // If the CLI supports resolving languages with default queries, use these
+    // as the set of supported languages. Otherwise, require the language to be
+    // a known language.
+    if (
+      resolveSupportedLanguagesUsingCli ||
+      KnownLanguage[extractor] !== undefined
+    ) {
+      supportedLanguages[extractor] = extractor;
+    }
+  }
+  // Populate language aliases
+  if (resolveResult.aliases) {
+    for (const [alias, extractor] of Object.entries(resolveResult.aliases)) {
+      supportedLanguages[alias] = extractor;
+    }
+  }
+  return supportedLanguages;
 }
 
-export function getNoLanguagesError(): string {
+const baseWorkflowsPath = ".github/workflows";
+
+/**
+ * Determines if there exists a `.github/workflows` directory with at least
+ * one file in it, which we use as an indicator that there are Actions
+ * workflows in the workspace. This doesn't perfectly detect whether there
+ * are actually workflows, but should be a good approximation.
+ *
+ * Alternatively, we could check specifically for yaml files, or call the
+ * API to check if it knows about workflows.
+ *
+ * @returns True if the non-empty directory exists, false if not.
+ */
+export function hasActionsWorkflows(sourceRoot: string): boolean {
+  const workflowsPath = path.resolve(sourceRoot, baseWorkflowsPath);
+  const stats = fs.lstatSync(workflowsPath, { throwIfNoEntry: false });
   return (
-    "Did not detect any languages to analyze. " +
-    "Please update input in workflow or check that GitHub detects the correct languages in your repository."
+    stats !== undefined &&
+    stats.isDirectory() &&
+    fs.readdirSync(workflowsPath).length > 0
   );
 }
 
-export function getUnknownLanguagesError(languages: string[]): string {
-  return `Did not recognize the following languages: ${languages.join(", ")}`;
-}
-
 /**
- * Gets the set of languages in the current repository that are
- * scannable by CodeQL.
+ * Gets the set of languages in the current repository.
  */
-export async function getLanguagesInRepo(
+export async function getRawLanguagesInRepo(
   repository: RepositoryNwo,
+  sourceRoot: string,
   logger: Logger,
-): Promise<Language[]> {
-  logger.debug(`GitHub repo ${repository.owner} ${repository.repo}`);
+): Promise<string[]> {
+  logger.debug(
+    `Automatically detecting languages (${repository.owner}/${repository.repo})`,
+  );
   const response = await api.getApiClient().rest.repos.listLanguages({
     owner: repository.owner,
     repo: repository.repo,
   });
 
   logger.debug(`Languages API response: ${JSON.stringify(response)}`);
+  const result = Object.keys(response.data as Record<string, number>).map(
+    (language) => language.trim().toLowerCase(),
+  );
 
-  // The GitHub API is going to return languages in order of popularity,
-  // When we pick a language to autobuild we want to pick the most popular traced language
-  // Since sets in javascript maintain insertion order, using a set here and then splatting it
-  // into an array gives us an array of languages ordered by popularity
-  const languages: Set<Language> = new Set();
-  for (const lang of Object.keys(response.data as Record<string, number>)) {
-    const parsedLang = parseLanguage(lang);
-    if (parsedLang !== undefined) {
-      languages.add(parsedLang);
-    }
+  if (hasActionsWorkflows(sourceRoot)) {
+    logger.debug(`Found a .github/workflows directory`);
+    result.push("actions");
   }
-  return [...languages];
+
+  logger.debug(`Raw languages in repository: ${result.join(", ")}`);
+
+  return result;
 }
 
 /**
@@ -294,75 +279,65 @@ export async function getLanguagesInRepo(
  * then throw an error.
  */
 export async function getLanguages(
-  codeQL: CodeQL,
+  codeql: CodeQL,
   languagesInput: string | undefined,
   repository: RepositoryNwo,
+  sourceRoot: string,
+  features: FeatureEnablement,
   logger: Logger,
 ): Promise<Language[]> {
   // Obtain languages without filtering them.
   const { rawLanguages, autodetected } = await getRawLanguages(
     languagesInput,
     repository,
+    sourceRoot,
     logger,
   );
 
-  let languages = rawLanguages;
-  if (autodetected) {
-    const supportedLanguages = Object.keys(await codeQL.resolveLanguages());
+  const languageMap = await getSupportedLanguageMap(codeql, features, logger);
+  const languagesSet = new Set<Language>();
+  const unknownLanguages: string[] = [];
 
-    languages = languages
-      .map(parseLanguage)
-      .filter((value) => value && supportedLanguages.includes(value))
-      .map((value) => value as Language);
-
-    logger.info(`Automatically detected languages: ${languages.join(", ")}`);
-  } else {
-    const aliases = await getLanguageAliases(codeQL);
-    if (aliases) {
-      languages = languages.map((lang) => aliases[lang] || lang);
+  // Make sure they are supported
+  for (const language of rawLanguages) {
+    const extractorName = languageMap[language];
+    if (extractorName === undefined) {
+      unknownLanguages.push(language);
+    } else {
+      languagesSet.add(extractorName);
     }
+  }
 
-    logger.info(`Languages from configuration: ${languages.join(", ")}`);
+  const languages = Array.from(languagesSet);
+
+  if (!autodetected && unknownLanguages.length > 0) {
+    throw new ConfigurationError(
+      errorMessages.getUnknownLanguagesError(unknownLanguages),
+    );
   }
 
   // If the languages parameter was not given and no languages were
   // detected then fail here as this is a workflow configuration error.
   if (languages.length === 0) {
-    throw new ConfigurationError(getNoLanguagesError());
+    throw new ConfigurationError(errorMessages.getNoLanguagesError());
   }
 
-  // Make sure they are supported
-  const parsedLanguages: Language[] = [];
-  const unknownLanguages: string[] = [];
-  for (const language of languages) {
-    const parsedLanguage = parseLanguage(language) as Language;
-    if (parsedLanguage === undefined) {
-      unknownLanguages.push(language);
-    } else if (!parsedLanguages.includes(parsedLanguage)) {
-      parsedLanguages.push(parsedLanguage);
-    }
+  if (autodetected) {
+    logger.info(`Autodetected languages: ${languages.join(", ")}`);
+  } else {
+    logger.info(`Languages from configuration: ${languages.join(", ")}`);
   }
 
-  // Any unknown languages here would have come directly from the input
-  // since we filter unknown languages coming from the GitHub API.
-  if (unknownLanguages.length > 0) {
-    throw new ConfigurationError(getUnknownLanguagesError(unknownLanguages));
-  }
-
-  return parsedLanguages;
+  return languages;
 }
 
-/**
- * Gets the set of languages supported by CodeQL, along with their aliases if supported by the
- * version of the CLI.
- */
-export async function getLanguageAliases(
-  codeql: CodeQL,
-): Promise<{ [alias: string]: string } | undefined> {
-  if (await codeQlVersionAtLeast(codeql, CODEQL_VERSION_LANGUAGE_ALIASING)) {
-    return (await codeql.betterResolveLanguages()).aliases;
-  }
-  return undefined;
+export function getRawLanguagesNoAutodetect(
+  languagesInput: string | undefined,
+): string[] {
+  return (languagesInput || "")
+    .split(",")
+    .map((x) => x.trim().toLowerCase())
+    .filter((x) => x.length > 0);
 }
 
 /**
@@ -378,35 +353,37 @@ export async function getLanguageAliases(
 export async function getRawLanguages(
   languagesInput: string | undefined,
   repository: RepositoryNwo,
+  sourceRoot: string,
   logger: Logger,
-) {
-  // Obtain from action input 'languages' if set
-  let rawLanguages = (languagesInput || "")
-    .split(",")
-    .map((x) => x.trim().toLowerCase())
-    .filter((x) => x.length > 0);
-  let autodetected: boolean;
-  if (rawLanguages.length) {
-    autodetected = false;
-  } else {
-    autodetected = true;
-
-    // Obtain all languages in the repo that can be analysed
-    rawLanguages = (await getLanguagesInRepo(repository, logger)) as string[];
+): Promise<{
+  rawLanguages: string[];
+  autodetected: boolean;
+}> {
+  // If the user has specified languages, use those.
+  const languagesFromInput = getRawLanguagesNoAutodetect(languagesInput);
+  if (languagesFromInput.length > 0) {
+    return { rawLanguages: languagesFromInput, autodetected: false };
   }
-  return { rawLanguages, autodetected };
+  // Otherwise, autodetect languages in the repository.
+  return {
+    rawLanguages: await getRawLanguagesInRepo(repository, sourceRoot, logger),
+    autodetected: true,
+  };
 }
 
 /** Inputs required to initialize a configuration. */
 export interface InitConfigInputs {
+  analysisKindsInput: string;
   languagesInput: string | undefined;
   queriesInput: string | undefined;
+  qualityQueriesInput: string | undefined;
   packsInput: string | undefined;
   configFile: string | undefined;
   dbLocation: string | undefined;
   configInput: string | undefined;
   buildModeInput: string | undefined;
   trapCachingEnabled: boolean;
+  dependencyCachingEnabled: string | undefined;
   debugMode: boolean;
   debugArtifactName: string;
   debugDatabaseName: string;
@@ -414,45 +391,61 @@ export interface InitConfigInputs {
   tempDir: string;
   codeql: CodeQL;
   workspacePath: string;
+  sourceRoot: string;
   githubVersion: GitHubVersion;
   apiDetails: api.GitHubApiCombinedDetails;
   features: FeatureEnablement;
+  repositoryProperties: RepositoryProperties;
   logger: Logger;
 }
 
-type GetDefaultConfigInputs = Omit<
-  InitConfigInputs,
-  "configFile" | "configInput"
->;
-
-type LoadConfigInputs = Omit<InitConfigInputs, "configInput"> & {
-  configFile: string;
-};
-
 /**
- * Get the default config for when the user has not supplied one.
+ * Initialise the CodeQL Action state, which includes the base configuration for the Action
+ * and computes the configuration for the CodeQL CLI.
  */
-export async function getDefaultConfig({
-  languagesInput,
-  queriesInput,
-  packsInput,
-  buildModeInput,
-  dbLocation,
-  trapCachingEnabled,
-  debugMode,
-  debugArtifactName,
-  debugDatabaseName,
-  repository,
-  tempDir,
-  codeql,
-  githubVersion,
-  features,
-  logger,
-}: GetDefaultConfigInputs): Promise<Config> {
+export async function initActionState(
+  {
+    analysisKindsInput,
+    languagesInput,
+    queriesInput,
+    qualityQueriesInput,
+    packsInput,
+    buildModeInput,
+    dbLocation,
+    trapCachingEnabled,
+    dependencyCachingEnabled,
+    debugMode,
+    debugArtifactName,
+    debugDatabaseName,
+    repository,
+    tempDir,
+    codeql,
+    sourceRoot,
+    githubVersion,
+    features,
+    repositoryProperties,
+    logger,
+  }: InitConfigInputs,
+  userConfig: UserConfig,
+): Promise<Config> {
+  const analysisKinds = await parseAnalysisKinds(analysisKindsInput);
+
+  // For backwards compatibility, add Code Quality to the enabled analysis kinds
+  // if an input to `quality-queries` was specified. We should remove this once
+  // `quality-queries` is no longer used.
+  if (
+    !analysisKinds.includes(AnalysisKind.CodeQuality) &&
+    qualityQueriesInput !== undefined
+  ) {
+    analysisKinds.push(AnalysisKind.CodeQuality);
+  }
+
   const languages = await getLanguages(
     codeql,
     languagesInput,
     repository,
+    sourceRoot,
+    features,
     logger,
   );
 
@@ -463,11 +456,30 @@ export async function getDefaultConfig({
     logger,
   );
 
-  const augmentationProperties = calculateAugmentation(
+  const augmentationProperties = await calculateAugmentation(
     packsInput,
     queriesInput,
+    repositoryProperties,
     languages,
   );
+
+  // If `code-quality` is the only enabled analysis kind, we don't support query customisation.
+  // It would be a problem if queries that are configured in repository properties cause `code-quality`-only
+  // analyses to break. We therefore ignore query customisations that are configured in repository properties
+  // if `code-quality` is the only enabled analysis kind.
+  if (
+    analysisKinds.length === 1 &&
+    analysisKinds.includes(AnalysisKind.CodeQuality) &&
+    augmentationProperties.repoPropertyQueries.input
+  ) {
+    logger.info(
+      `Ignoring queries configured in the repository properties, because query customisations are not supported for Code Quality analyses.`,
+    );
+    augmentationProperties.repoPropertyQueries = {
+      combines: false,
+      input: undefined,
+    };
+  }
 
   const { trapCaches, trapCacheDownloadTime } = await downloadCacheWithTime(
     trapCachingEnabled,
@@ -476,10 +488,21 @@ export async function getDefaultConfig({
     logger,
   );
 
+  // Compute the full Code Scanning configuration that combines the configuration from the
+  // configuration file / `config` input with other inputs, such as `queries`.
+  const computedConfig = generateCodeScanningConfig(
+    logger,
+    userConfig,
+    augmentationProperties,
+  );
+
   return {
+    version: getActionVersion(),
+    analysisKinds,
     languages,
     buildMode,
-    originalUserInput: {},
+    originalUserInput: userConfig,
+    computedConfig,
     tempDir,
     codeQLCmd: codeql.getPath(),
     gitHubVersion: githubVersion,
@@ -487,9 +510,13 @@ export async function getDefaultConfig({
     debugMode,
     debugArtifactName,
     debugDatabaseName,
-    augmentationProperties,
     trapCaches,
     trapCacheDownloadTime,
+    dependencyCachingEnabled: getCachingKind(dependencyCachingEnabled),
+    extraQueryExclusions: [],
+    overlayDatabaseMode: OverlayDatabaseMode.None,
+    useOverlayDatabaseCaching: false,
+    repositoryProperties,
   };
 }
 
@@ -499,10 +526,10 @@ async function downloadCacheWithTime(
   languages: Language[],
   logger: Logger,
 ): Promise<{
-  trapCaches: Partial<Record<Language, string>>;
+  trapCaches: { [language: string]: string };
   trapCacheDownloadTime: number;
 }> {
-  let trapCaches = {};
+  let trapCaches: { [language: string]: string } = {};
   let trapCacheDownloadTime = 0;
   if (trapCachingEnabled) {
     const start = performance.now();
@@ -512,31 +539,12 @@ async function downloadCacheWithTime(
   return { trapCaches, trapCacheDownloadTime };
 }
 
-/**
- * Load the config from the given file.
- */
-async function loadConfig({
-  languagesInput,
-  queriesInput,
-  packsInput,
-  buildModeInput,
-  configFile,
-  dbLocation,
-  trapCachingEnabled,
-  debugMode,
-  debugArtifactName,
-  debugDatabaseName,
-  repository,
-  tempDir,
-  codeql,
-  workspacePath,
-  githubVersion,
-  apiDetails,
-  features,
-  logger,
-}: LoadConfigInputs): Promise<Config> {
-  let parsedYAML: UserConfig;
-
+async function loadUserConfig(
+  configFile: string,
+  workspacePath: string,
+  apiDetails: api.GitHubApiCombinedDetails,
+  tempDir: string,
+): Promise<UserConfig> {
   if (isLocal(configFile)) {
     if (configFile !== userConfigFromActionPath(tempDir)) {
       // If the config file is not generated by the Action, it should be relative to the workspace.
@@ -544,279 +552,216 @@ async function loadConfig({
       // Error if the config file is now outside of the workspace
       if (!(configFile + path.sep).startsWith(workspacePath + path.sep)) {
         throw new ConfigurationError(
-          getConfigFileOutsideWorkspaceErrorMessage(configFile),
+          errorMessages.getConfigFileOutsideWorkspaceErrorMessage(configFile),
         );
       }
     }
-    parsedYAML = getLocalConfig(configFile);
+    return getLocalConfig(configFile);
   } else {
-    parsedYAML = await getRemoteConfig(configFile, apiDetails);
+    return await getRemoteConfig(configFile, apiDetails);
   }
+}
 
-  const languages = await getLanguages(
-    codeql,
-    languagesInput,
-    repository,
-    logger,
-  );
+const OVERLAY_ANALYSIS_FEATURES: Record<Language, Feature> = {
+  actions: Feature.OverlayAnalysisActions,
+  cpp: Feature.OverlayAnalysisCpp,
+  csharp: Feature.OverlayAnalysisCsharp,
+  go: Feature.OverlayAnalysisGo,
+  java: Feature.OverlayAnalysisJava,
+  javascript: Feature.OverlayAnalysisJavascript,
+  python: Feature.OverlayAnalysisPython,
+  ruby: Feature.OverlayAnalysisRuby,
+  rust: Feature.OverlayAnalysisRust,
+  swift: Feature.OverlayAnalysisSwift,
+};
 
-  const buildMode = await parseBuildModeInput(
-    buildModeInput,
-    languages,
-    features,
-    logger,
-  );
+const OVERLAY_ANALYSIS_CODE_SCANNING_FEATURES: Record<Language, Feature> = {
+  actions: Feature.OverlayAnalysisCodeScanningActions,
+  cpp: Feature.OverlayAnalysisCodeScanningCpp,
+  csharp: Feature.OverlayAnalysisCodeScanningCsharp,
+  go: Feature.OverlayAnalysisCodeScanningGo,
+  java: Feature.OverlayAnalysisCodeScanningJava,
+  javascript: Feature.OverlayAnalysisCodeScanningJavascript,
+  python: Feature.OverlayAnalysisCodeScanningPython,
+  ruby: Feature.OverlayAnalysisCodeScanningRuby,
+  rust: Feature.OverlayAnalysisCodeScanningRust,
+  swift: Feature.OverlayAnalysisCodeScanningSwift,
+};
 
-  const augmentationProperties = calculateAugmentation(
-    packsInput,
-    queriesInput,
-    languages,
-  );
-
-  const { trapCaches, trapCacheDownloadTime } = await downloadCacheWithTime(
-    trapCachingEnabled,
-    codeql,
-    languages,
-    logger,
-  );
-
-  return {
-    languages,
-    buildMode,
-    originalUserInput: parsedYAML,
-    tempDir,
-    codeQLCmd: codeql.getPath(),
-    gitHubVersion: githubVersion,
-    dbLocation: dbLocationOrDefault(dbLocation, tempDir),
-    debugMode,
-    debugArtifactName,
-    debugDatabaseName,
-    augmentationProperties,
-    trapCaches,
-    trapCacheDownloadTime,
-  };
+async function isOverlayAnalysisFeatureEnabled(
+  repository: RepositoryNwo,
+  features: FeatureEnablement,
+  codeql: CodeQL,
+  languages: Language[],
+  codeScanningConfig: UserConfig,
+): Promise<boolean> {
+  // TODO: Remove the repository owner check once support for overlay analysis
+  // stabilizes, and no more backward-incompatible changes are expected.
+  if (!["github", "dsp-testing"].includes(repository.owner)) {
+    return false;
+  }
+  if (!(await features.getValue(Feature.OverlayAnalysis, codeql))) {
+    return false;
+  }
+  let enableForCodeScanningOnly = false;
+  for (const language of languages) {
+    const feature = OVERLAY_ANALYSIS_FEATURES[language];
+    if (feature && (await features.getValue(feature, codeql))) {
+      continue;
+    }
+    const codeScanningFeature =
+      OVERLAY_ANALYSIS_CODE_SCANNING_FEATURES[language];
+    if (
+      codeScanningFeature &&
+      (await features.getValue(codeScanningFeature, codeql))
+    ) {
+      enableForCodeScanningOnly = true;
+      continue;
+    }
+    return false;
+  }
+  if (enableForCodeScanningOnly) {
+    // A code-scanning configuration runs only the (default) code-scanning suite
+    // if the default queries are not disabled, and no packs, queries, or
+    // query-filters are specified.
+    return (
+      codeScanningConfig["disable-default-queries"] !== true &&
+      codeScanningConfig.packs === undefined &&
+      codeScanningConfig.queries === undefined &&
+      codeScanningConfig["query-filters"] === undefined
+    );
+  }
+  return true;
 }
 
 /**
- * Calculates how the codeql config file needs to be augmented before passing
- * it to the CLI. The reason this is necessary is the codeql-action can be called
- * with extra inputs from the workflow. These inputs are not part of the config
- * and the CLI does not know about these inputs so we need to inject them into
- * the config file sent to the CLI.
+ * Calculate and validate the overlay database mode and caching to use.
  *
- * @param rawPacksInput The packs input from the action configuration.
- * @param rawQueriesInput The queries input from the action configuration.
- * @param languages The languages that the config file is for. If the packs input
- *    is non-empty, then there must be exactly one language. Otherwise, an
- *    error is thrown.
+ * - If the environment variable `CODEQL_OVERLAY_DATABASE_MODE` is set, use it.
+ *   In this case, the workflow is responsible for managing database storage and
+ *   retrieval, and the action will not perform overlay database caching. Think
+ *   of it as a "manual control" mode where the calling workflow is responsible
+ *   for making sure that everything is set up correctly.
+ * - Otherwise, if `Feature.OverlayAnalysis` is enabled, calculate the mode
+ *   based on what we are analyzing. Think of it as a "automatic control" mode
+ *   where the action will do the right thing by itself.
+ *   - If we are analyzing a pull request, use `Overlay` with caching.
+ *   - If we are analyzing the default branch, use `OverlayBase` with caching.
+ * - Otherwise, use `None`.
  *
- * @returns The properties that need to be augmented in the config file.
+ * For `Overlay` and `OverlayBase`, the function performs further checks and
+ * reverts to `None` if any check should fail.
  *
- * @throws An error if the packs input is non-empty and the languages input does
- *     not have exactly one language.
+ * @returns An object containing the overlay database mode and whether the
+ * action should perform overlay-base database caching.
  */
-// exported for testing.
-export function calculateAugmentation(
-  rawPacksInput: string | undefined,
-  rawQueriesInput: string | undefined,
+export async function getOverlayDatabaseMode(
+  codeql: CodeQL,
+  repository: RepositoryNwo,
+  features: FeatureEnablement,
   languages: Language[],
-): AugmentationProperties {
-  const packsInputCombines = shouldCombine(rawPacksInput);
-  const packsInput = parsePacksFromInput(
-    rawPacksInput,
-    languages,
-    packsInputCombines,
-  );
-  const queriesInputCombines = shouldCombine(rawQueriesInput);
-  const queriesInput = parseQueriesFromInput(
-    rawQueriesInput,
-    queriesInputCombines,
-  );
+  sourceRoot: string,
+  buildMode: BuildMode | undefined,
+  codeScanningConfig: UserConfig,
+  logger: Logger,
+): Promise<{
+  overlayDatabaseMode: OverlayDatabaseMode;
+  useOverlayDatabaseCaching: boolean;
+}> {
+  let overlayDatabaseMode = OverlayDatabaseMode.None;
+  let useOverlayDatabaseCaching = false;
 
-  return {
-    packsInputCombines,
-    packsInput: packsInput?.[languages[0]],
-    queriesInput,
-    queriesInputCombines,
-  };
-}
-
-function parseQueriesFromInput(
-  rawQueriesInput: string | undefined,
-  queriesInputCombines: boolean,
-) {
-  if (!rawQueriesInput) {
-    return undefined;
-  }
-
-  const trimmedInput = queriesInputCombines
-    ? rawQueriesInput.trim().slice(1).trim()
-    : rawQueriesInput?.trim() ?? "";
-  if (queriesInputCombines && trimmedInput.length === 0) {
-    throw new ConfigurationError(
-      getConfigFilePropertyError(
-        undefined,
-        "queries",
-        "A '+' was used in the 'queries' input to specify that you wished to add some packs to your CodeQL analysis. However, no packs were specified. Please either remove the '+' or specify some packs.",
-      ),
+  const modeEnv = process.env.CODEQL_OVERLAY_DATABASE_MODE;
+  // Any unrecognized CODEQL_OVERLAY_DATABASE_MODE value will be ignored and
+  // treated as if the environment variable was not set.
+  if (
+    modeEnv === OverlayDatabaseMode.Overlay ||
+    modeEnv === OverlayDatabaseMode.OverlayBase ||
+    modeEnv === OverlayDatabaseMode.None
+  ) {
+    overlayDatabaseMode = modeEnv;
+    logger.info(
+      `Setting overlay database mode to ${overlayDatabaseMode} ` +
+        "from the CODEQL_OVERLAY_DATABASE_MODE environment variable.",
     );
-  }
-  return trimmedInput.split(",").map((query) => ({ uses: query.trim() }));
-}
-
-/**
- * Pack names must be in the form of `scope/name`, with only alpha-numeric characters,
- * and `-` allowed as long as not the first or last char.
- **/
-const PACK_IDENTIFIER_PATTERN = (function () {
-  const alphaNumeric = "[a-z0-9]";
-  const alphaNumericDash = "[a-z0-9-]";
-  const component = `${alphaNumeric}(${alphaNumericDash}*${alphaNumeric})?`;
-  return new RegExp(`^${component}/${component}$`);
-})();
-
-// Exported for testing
-export function parsePacksFromInput(
-  rawPacksInput: string | undefined,
-  languages: Language[],
-  packsInputCombines: boolean,
-): Packs | undefined {
-  if (!rawPacksInput?.trim()) {
-    return undefined;
-  }
-
-  if (languages.length > 1) {
-    throw new ConfigurationError(
-      "Cannot specify a 'packs' input in a multi-language analysis. Use a codeql-config.yml file instead and specify packs by language.",
-    );
-  } else if (languages.length === 0) {
-    throw new ConfigurationError(
-      "No languages specified. Cannot process the packs input.",
-    );
-  }
-
-  rawPacksInput = rawPacksInput.trim();
-  if (packsInputCombines) {
-    rawPacksInput = rawPacksInput.trim().substring(1).trim();
-    if (!rawPacksInput) {
-      throw new ConfigurationError(
-        getConfigFilePropertyError(
-          undefined,
-          "packs",
-          "A '+' was used in the 'packs' input to specify that you wished to add some packs to your CodeQL analysis. However, no packs were specified. Please either remove the '+' or specify some packs.",
-        ),
+  } else if (
+    await isOverlayAnalysisFeatureEnabled(
+      repository,
+      features,
+      codeql,
+      languages,
+      codeScanningConfig,
+    )
+  ) {
+    if (isAnalyzingPullRequest()) {
+      overlayDatabaseMode = OverlayDatabaseMode.Overlay;
+      useOverlayDatabaseCaching = true;
+      logger.info(
+        `Setting overlay database mode to ${overlayDatabaseMode} ` +
+          "with caching because we are analyzing a pull request.",
+      );
+    } else if (await isAnalyzingDefaultBranch()) {
+      overlayDatabaseMode = OverlayDatabaseMode.OverlayBase;
+      useOverlayDatabaseCaching = true;
+      logger.info(
+        `Setting overlay database mode to ${overlayDatabaseMode} ` +
+          "with caching because we are analyzing the default branch.",
       );
     }
   }
 
-  return {
-    [languages[0]]: rawPacksInput.split(",").reduce((packs, pack) => {
-      packs.push(validatePackSpecification(pack));
-      return packs;
-    }, [] as string[]),
+  const nonOverlayAnalysis = {
+    overlayDatabaseMode: OverlayDatabaseMode.None,
+    useOverlayDatabaseCaching: false,
   };
-}
 
-/**
- * Validates that this package specification is syntactically correct.
- * It may not point to any real package, but after this function returns
- * without throwing, we are guaranteed that the package specification
- * is roughly correct.
- *
- * The CLI itself will do a more thorough validation of the package
- * specification.
- *
- * A package specification looks like this:
- *
- * `scope/name@version:path`
- *
- * Version and path are optional.
- *
- * @param packStr the package specification to verify.
- * @param configFile Config file to use for error reporting
- */
-export function parsePacksSpecification(packStr: string): Pack {
-  if (typeof packStr !== "string") {
-    throw new ConfigurationError(getPacksStrInvalid(packStr));
-  }
-
-  packStr = packStr.trim();
-  const atIndex = packStr.indexOf("@");
-  const colonIndex = packStr.indexOf(":", atIndex);
-  const packStart = 0;
-  const versionStart = atIndex + 1 || undefined;
-  const pathStart = colonIndex + 1 || undefined;
-  const packEnd = Math.min(
-    atIndex > 0 ? atIndex : Infinity,
-    colonIndex > 0 ? colonIndex : Infinity,
-    packStr.length,
-  );
-  const versionEnd = versionStart
-    ? Math.min(colonIndex > 0 ? colonIndex : Infinity, packStr.length)
-    : undefined;
-  const pathEnd = pathStart ? packStr.length : undefined;
-
-  const packName = packStr.slice(packStart, packEnd).trim();
-  const version = versionStart
-    ? packStr.slice(versionStart, versionEnd).trim()
-    : undefined;
-  const packPath = pathStart
-    ? packStr.slice(pathStart, pathEnd).trim()
-    : undefined;
-
-  if (!PACK_IDENTIFIER_PATTERN.test(packName)) {
-    throw new ConfigurationError(getPacksStrInvalid(packStr));
-  }
-  if (version) {
-    try {
-      new semver.Range(version);
-    } catch (e) {
-      // The range string is invalid. OK to ignore the caught error
-      throw new ConfigurationError(getPacksStrInvalid(packStr));
-    }
+  if (overlayDatabaseMode === OverlayDatabaseMode.None) {
+    return nonOverlayAnalysis;
   }
 
   if (
-    packPath &&
-    (path.isAbsolute(packPath) ||
-      // Permit using "/" instead of "\" on Windows
-      // Use `x.split(y).join(z)` as a polyfill for `x.replaceAll(y, z)` since
-      // if we used a regex we'd need to escape the path separator on Windows
-      // which seems more awkward.
-      path.normalize(packPath).split(path.sep).join("/") !==
-        packPath.split(path.sep).join("/"))
+    buildMode !== BuildMode.None &&
+    (
+      await Promise.all(
+        languages.map(
+          async (l) =>
+            l !== KnownLanguage.go && // Workaround to allow overlay analysis for Go with any build
+            // mode, since it does not yet support BMN. The Go autobuilder and/or extractor will
+            // ensure that overlay-base databases are only created for supported Go build setups,
+            // and that we'll fall back to full databases in other cases.
+            (await codeql.isTracedLanguage(l)),
+        ),
+      )
+    ).some(Boolean)
   ) {
-    throw new ConfigurationError(getPacksStrInvalid(packStr));
+    logger.warning(
+      `Cannot build an ${overlayDatabaseMode} database because ` +
+        `build-mode is set to "${buildMode}" instead of "none". ` +
+        "Falling back to creating a normal full database instead.",
+    );
+    return nonOverlayAnalysis;
   }
-
-  if (!packPath && pathStart) {
-    // 0 length path
-    throw new ConfigurationError(getPacksStrInvalid(packStr));
+  if (!(await codeQlVersionAtLeast(codeql, CODEQL_OVERLAY_MINIMUM_VERSION))) {
+    logger.warning(
+      `Cannot build an ${overlayDatabaseMode} database because ` +
+        `the CodeQL CLI is older than ${CODEQL_OVERLAY_MINIMUM_VERSION}. ` +
+        "Falling back to creating a normal full database instead.",
+    );
+    return nonOverlayAnalysis;
+  }
+  if ((await getGitRoot(sourceRoot)) === undefined) {
+    logger.warning(
+      `Cannot build an ${overlayDatabaseMode} database because ` +
+        `the source root "${sourceRoot}" is not inside a git repository. ` +
+        "Falling back to creating a normal full database instead.",
+    );
+    return nonOverlayAnalysis;
   }
 
   return {
-    name: packName,
-    version,
-    path: packPath,
+    overlayDatabaseMode,
+    useOverlayDatabaseCaching,
   };
-}
-
-export function validatePackSpecification(pack: string) {
-  return prettyPrintPack(parsePacksSpecification(pack));
-}
-
-/**
- * The convention in this action is that an input value that is prefixed with a '+' will
- * be combined with the corresponding value in the config file.
- *
- * Without a '+', an input value will override the corresponding value in the config file.
- *
- * @param inputValue The input value to process.
- * @returns true if the input value should replace the corresponding value in the config file,
- *          false if it should be appended.
- */
-function shouldCombine(inputValue?: string): boolean {
-  return !!inputValue?.trim().startsWith("+");
 }
 
 function dbLocationOrDefault(
@@ -831,14 +776,25 @@ function userConfigFromActionPath(tempDir: string): string {
 }
 
 /**
+ * Checks whether the given `UserConfig` contains any query customisations.
+ *
+ * @returns Returns `true` if the `UserConfig` customises which queries are run.
+ */
+function hasQueryCustomisation(userConfig: UserConfig): boolean {
+  return (
+    isDefined(userConfig["disable-default-queries"]) ||
+    isDefined(userConfig.queries) ||
+    isDefined(userConfig["query-filters"])
+  );
+}
+
+/**
  * Load and return the config.
  *
  * This will parse the config from the user input if present, or generate
  * a default config. The parsed config is then stored to a known location.
  */
 export async function initConfig(inputs: InitConfigInputs): Promise<Config> {
-  let config: Config;
-
   const { logger, tempDir } = inputs;
 
   // if configInput is set, it takes precedence over configFile
@@ -853,17 +809,74 @@ export async function initConfig(inputs: InitConfigInputs): Promise<Config> {
     logger.debug(`Using config from action input: ${inputs.configFile}`);
   }
 
-  // If no config file was provided create an empty one
+  let userConfig: UserConfig = {};
   if (!inputs.configFile) {
     logger.debug("No configuration file was provided");
-    config = await getDefaultConfig(inputs);
   } else {
-    // Convince the type checker that inputs.configFile is defined.
-    config = await loadConfig({ ...inputs, configFile: inputs.configFile });
+    logger.debug(`Using configuration file: ${inputs.configFile}`);
+    userConfig = await loadUserConfig(
+      inputs.configFile,
+      inputs.workspacePath,
+      inputs.apiDetails,
+      tempDir,
+    );
   }
 
-  // Save the config so we can easily access it again in the future
-  await saveConfig(config, logger);
+  const config = await initActionState(inputs, userConfig);
+
+  // If Code Quality analysis is the only enabled analysis kind, then we will initialise
+  // the database for Code Quality. That entails disabling the default queries and only
+  // running quality queries. We do not currently support query customisations in that case.
+  if (config.analysisKinds.length === 1 && isCodeQualityEnabled(config)) {
+    // Warn if any query customisations are present in the computed configuration.
+    if (hasQueryCustomisation(config.computedConfig)) {
+      throw new ConfigurationError(
+        "Query customizations are unsupported, because only `code-quality` analysis is enabled.",
+      );
+    }
+
+    const queries = codeQualityQueries.map((v) => ({ uses: v }));
+
+    // Set the query customisation options for Code Quality only analysis.
+    config.computedConfig["disable-default-queries"] = true;
+    config.computedConfig.queries = queries;
+    config.computedConfig["query-filters"] = [];
+  }
+
+  // The choice of overlay database mode depends on the selection of languages
+  // and queries, which in turn depends on the user config and the augmentation
+  // properties. So we need to calculate the overlay database mode after the
+  // rest of the config has been populated.
+  const { overlayDatabaseMode, useOverlayDatabaseCaching } =
+    await getOverlayDatabaseMode(
+      inputs.codeql,
+      inputs.repository,
+      inputs.features,
+      config.languages,
+      inputs.sourceRoot,
+      config.buildMode,
+      config.computedConfig,
+      logger,
+    );
+  logger.info(
+    `Using overlay database mode: ${overlayDatabaseMode} ` +
+      `${useOverlayDatabaseCaching ? "with" : "without"} caching.`,
+  );
+  config.overlayDatabaseMode = overlayDatabaseMode;
+  config.useOverlayDatabaseCaching = useOverlayDatabaseCaching;
+
+  if (
+    overlayDatabaseMode === OverlayDatabaseMode.Overlay ||
+    (await shouldPerformDiffInformedAnalysis(
+      inputs.codeql,
+      inputs.features,
+      logger,
+    ))
+  ) {
+    config.extraQueryExclusions.push({
+      exclude: { tags: "exclude-from-incremental" },
+    });
+  }
   return config;
 }
 
@@ -874,11 +887,20 @@ function parseRegistries(
     return registriesInput
       ? (yaml.load(registriesInput) as RegistryConfigWithCredentials[])
       : undefined;
-  } catch (e) {
+  } catch {
     throw new ConfigurationError(
       "Invalid registries input. Must be a YAML string.",
     );
   }
+}
+
+export function parseRegistriesWithoutCredentials(
+  registriesInput?: string,
+): RegistryConfigNoCredentials[] | undefined {
+  return parseRegistries(registriesInput)?.map((r) => {
+    const { url, packages, kind } = r;
+    return { url, packages, kind };
+  });
 }
 
 function isLocal(configPath: string): boolean {
@@ -894,7 +916,7 @@ function getLocalConfig(configFile: string): UserConfig {
   // Error if the file does not exist
   if (!fs.existsSync(configFile)) {
     throw new ConfigurationError(
-      getConfigFileDoesNotExistErrorMessage(configFile),
+      errorMessages.getConfigFileDoesNotExistErrorMessage(configFile),
     );
   }
 
@@ -913,7 +935,7 @@ async function getRemoteConfig(
   // 5 = 4 groups + the whole expression
   if (pieces === null || pieces.groups === undefined || pieces.length < 5) {
     throw new ConfigurationError(
-      getConfigFileRepoFormatInvalidMessage(configFile),
+      errorMessages.getConfigFileRepoFormatInvalidMessage(configFile),
     );
   }
 
@@ -931,10 +953,12 @@ async function getRemoteConfig(
     fileContents = response.data.content;
   } else if (Array.isArray(response.data)) {
     throw new ConfigurationError(
-      getConfigFileDirectoryGivenMessage(configFile),
+      errorMessages.getConfigFileDirectoryGivenMessage(configFile),
     );
   } else {
-    throw new ConfigurationError(getConfigFileFormatInvalidMessage(configFile));
+    throw new ConfigurationError(
+      errorMessages.getConfigFileFormatInvalidMessage(configFile),
+    );
   }
 
   return yaml.load(
@@ -952,7 +976,7 @@ export function getPathToParsedConfigFile(tempDir: string): string {
 /**
  * Store the given config to the path returned from getPathToParsedConfigFile.
  */
-async function saveConfig(config: Config, logger: Logger) {
+export async function saveConfig(config: Config, logger: Logger) {
   const configString = JSON.stringify(config);
   const configFile = getPathToParsedConfigFile(config.tempDir);
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
@@ -976,7 +1000,21 @@ export async function getConfig(
   const configString = fs.readFileSync(configFile, "utf8");
   logger.debug("Loaded config:");
   logger.debug(configString);
-  return JSON.parse(configString) as Config;
+
+  const config = JSON.parse(configString) as Partial<Config>;
+
+  if (config.version === undefined) {
+    throw new ConfigurationError(
+      `Loaded configuration file, but it does not contain the expected 'version' field.`,
+    );
+  }
+  if (config.version !== getActionVersion()) {
+    throw new ConfigurationError(
+      `Loaded a configuration file for version '${config.version}', but running version '${getActionVersion()}'`,
+    );
+  }
+
+  return config as Config;
 }
 
 /**
@@ -1044,6 +1082,7 @@ function createRegistriesBlock(registries: RegistryConfigWithCredentials[]): {
     // ensure the url ends with a slash to avoid a bug in the CLI 2.10.4
     url: !registry?.url.endsWith("/") ? `${registry.url}/` : registry.url,
     packages: registry.packages,
+    kind: registry.kind,
   }));
   const qlconfig = {
     registries: safeRegistries,
@@ -1109,7 +1148,7 @@ export async function parseBuildModeInput(
   }
 
   if (
-    languages.includes(Language.csharp) &&
+    languages.includes(KnownLanguage.csharp) &&
     (await features.getValue(Feature.DisableCsharpBuildless))
   ) {
     logger.warning(
@@ -1119,7 +1158,7 @@ export async function parseBuildModeInput(
   }
 
   if (
-    languages.includes(Language.java) &&
+    languages.includes(KnownLanguage.java) &&
     (await features.getValue(Feature.DisableJavaBuildlessEnabled))
   ) {
     logger.warning(
@@ -1128,4 +1167,79 @@ export async function parseBuildModeInput(
     return BuildMode.Autobuild;
   }
   return input as BuildMode;
+}
+
+/**
+ * Appends `extraQueryExclusions` to `cliConfig`'s `query-filters`.
+ *
+ * @param extraQueryExclusions The extra query exclusions to append to the `query-filters`.
+ * @param cliConfig The CodeQL CLI configuration to extend.
+ * @returns Returns `cliConfig` if there are no extra query exclusions
+ *          or a copy of `cliConfig` where the extra query exclusions
+ *          have been appended to `query-filters`.
+ */
+export function appendExtraQueryExclusions(
+  extraQueryExclusions: ExcludeQueryFilter[],
+  cliConfig: UserConfig,
+): Readonly<UserConfig> {
+  // make a copy so we can modify it and so that modifications to the input
+  // object do not affect the result that is marked as `Readonly`.
+  const augmentedConfig = cloneObject(cliConfig);
+
+  if (extraQueryExclusions.length === 0) {
+    return augmentedConfig;
+  }
+
+  augmentedConfig["query-filters"] = [
+    // Ordering matters. If the first filter is an inclusion, it implicitly
+    // excludes all queries that are not included. If it is an exclusion,
+    // it implicitly includes all queries that are not excluded. So user
+    // filters (if any) should always be first to preserve intent.
+    ...(augmentedConfig["query-filters"] || []),
+    ...extraQueryExclusions,
+  ];
+  if (augmentedConfig["query-filters"]?.length === 0) {
+    delete augmentedConfig["query-filters"];
+  }
+
+  return augmentedConfig;
+}
+
+/**
+ * Returns `true` if Code Scanning analysis is enabled, or `false` if not.
+ */
+export function isCodeScanningEnabled(config: Config): boolean {
+  return config.analysisKinds.includes(AnalysisKind.CodeScanning);
+}
+
+/**
+ * Returns `true` if Code Quality analysis is enabled, or `false` if not.
+ */
+export function isCodeQualityEnabled(config: Config): boolean {
+  return config.analysisKinds.includes(AnalysisKind.CodeQuality);
+}
+
+/**
+ * Returns the primary analysis kind that the Action is initialised with. This is
+ * always `AnalysisKind.CodeScanning` unless `AnalysisKind.CodeScanning` is not enabled.
+ *
+ * @returns Returns `AnalysisKind.CodeScanning` if `AnalysisKind.CodeScanning` is enabled;
+ * otherwise `AnalysisKind.CodeQuality`.
+ */
+export function getPrimaryAnalysisKind(config: Config): AnalysisKind {
+  return isCodeScanningEnabled(config)
+    ? AnalysisKind.CodeScanning
+    : AnalysisKind.CodeQuality;
+}
+
+/**
+ * Returns the primary analysis configuration that the Action is initialised with. This is
+ * always `CodeScanning` unless `CodeScanning` is not enabled.
+ *
+ * @returns Returns `CodeScanning` if `AnalysisKind.CodeScanning` is enabled; otherwise `CodeQuality`.
+ */
+export function getPrimaryAnalysisConfig(config: Config): AnalysisConfig {
+  return getPrimaryAnalysisKind(config) === AnalysisKind.CodeScanning
+    ? CodeScanning
+    : CodeQuality;
 }

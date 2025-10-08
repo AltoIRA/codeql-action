@@ -395,9 +395,9 @@ async function testLanguageAliases(
             },
           },
           steps: [
-            { uses: "actions/checkout@v3" },
-            { uses: "github/codeql-action/init@v3" },
-            { uses: "github/codeql-action/analyze@v3" },
+            { uses: "actions/checkout@v4" },
+            { uses: "github/codeql-action/init@v4" },
+            { uses: "github/codeql-action/analyze@v4" },
           ],
         },
       },
@@ -655,6 +655,65 @@ test("getWorkflowErrors() should not report a warning if there is a workflow_cal
   t.deepEqual(...errorCodes(errors, []));
 });
 
+test("getWorkflowErrors() should report a warning if different versions of the CodeQL Action are used", async (t) => {
+  const errors = await getWorkflowErrors(
+    yaml.load(`
+      name: "CodeQL"
+      on:
+        push:
+          branches: [main]
+      jobs:
+        analyze:
+          steps:
+            - uses: github/codeql-action/init@v2
+            - uses: github/codeql-action/analyze@v4
+    `) as Workflow,
+    await getCodeQLForTesting(),
+  );
+
+  t.deepEqual(
+    ...errorCodes(errors, [WorkflowErrors.InconsistentActionVersion]),
+  );
+});
+
+test("getWorkflowErrors() should not report a warning if the same versions of the CodeQL Action are used", async (t) => {
+  const errors = await getWorkflowErrors(
+    yaml.load(`
+      name: "CodeQL"
+      on:
+        push:
+          branches: [main]
+      jobs:
+        analyze:
+          steps:
+            - uses: github/codeql-action/init@v4
+            - uses: github/codeql-action/analyze@v4
+    `) as Workflow,
+    await getCodeQLForTesting(),
+  );
+
+  t.deepEqual(...errorCodes(errors, []));
+});
+
+test("getWorkflowErrors() should not report a warning involving versions of other actions", async (t) => {
+  const errors = await getWorkflowErrors(
+    yaml.load(`
+      name: "CodeQL"
+      on:
+        push:
+          branches: [main]
+      jobs:
+        analyze:
+          steps:
+            - uses: actions/checkout@v5
+            - uses: github/codeql-action/init@v4
+    `) as Workflow,
+    await getCodeQLForTesting(),
+  );
+
+  t.deepEqual(...errorCodes(errors, []));
+});
+
 test("getCategoryInputOrThrow returns category for simple workflow with category", (t) => {
   process.env["GITHUB_REPOSITORY"] = "github/codeql-action-fake-repository";
   t.is(
@@ -664,9 +723,9 @@ test("getCategoryInputOrThrow returns category for simple workflow with category
           analysis:
             runs-on: ubuntu-latest
             steps:
-              - uses: actions/checkout@v3
-              - uses: github/codeql-action/init@v3
-              - uses: github/codeql-action/analyze@v3
+              - uses: actions/checkout@v4
+              - uses: github/codeql-action/init@v4
+              - uses: github/codeql-action/analyze@v4
                 with:
                   category: some-category
       `) as Workflow,
@@ -686,9 +745,9 @@ test("getCategoryInputOrThrow returns undefined for simple workflow without cate
           analysis:
             runs-on: ubuntu-latest
             steps:
-              - uses: actions/checkout@v3
-              - uses: github/codeql-action/init@v3
-              - uses: github/codeql-action/analyze@v3
+              - uses: actions/checkout@v4
+              - uses: github/codeql-action/init@v4
+              - uses: github/codeql-action/analyze@v4
       `) as Workflow,
       "analysis",
       {},
@@ -706,19 +765,19 @@ test("getCategoryInputOrThrow returns category for workflow with multiple jobs",
           foo:
             runs-on: ubuntu-latest
             steps:
-              - uses: actions/checkout@v3
-              - uses: github/codeql-action/init@v3
+              - uses: actions/checkout@v4
+              - uses: github/codeql-action/init@v4
               - runs: ./build foo
-              - uses: github/codeql-action/analyze@v3
+              - uses: github/codeql-action/analyze@v4
                 with:
                   category: foo-category
           bar:
             runs-on: ubuntu-latest
             steps:
-              - uses: actions/checkout@v3
-              - uses: github/codeql-action/init@v3
+              - uses: actions/checkout@v4
+              - uses: github/codeql-action/init@v4
               - runs: ./build bar
-              - uses: github/codeql-action/analyze@v3
+              - uses: github/codeql-action/analyze@v4
                 with:
                   category: bar-category
       `) as Workflow,
@@ -741,11 +800,11 @@ test("getCategoryInputOrThrow finds category for workflow with language matrix",
               matrix:
                 language: [javascript, python]
             steps:
-              - uses: actions/checkout@v3
-              - uses: github/codeql-action/init@v3
+              - uses: actions/checkout@v4
+              - uses: github/codeql-action/init@v4
                 with:
                   language: \${{ matrix.language }}
-              - uses: github/codeql-action/analyze@v3
+              - uses: github/codeql-action/analyze@v4
                 with:
                   category: "/language:\${{ matrix.language }}"
       `) as Workflow,
@@ -765,9 +824,9 @@ test("getCategoryInputOrThrow throws error for workflow with dynamic category", 
           jobs:
             analysis:
               steps:
-                - uses: actions/checkout@v3
-                - uses: github/codeql-action/init@v3
-                - uses: github/codeql-action/analyze@v3
+                - uses: actions/checkout@v4
+                - uses: github/codeql-action/init@v4
+                - uses: github/codeql-action/analyze@v4
                   with:
                     category: "\${{ github.workflow }}"
         `) as Workflow,
@@ -792,12 +851,12 @@ test("getCategoryInputOrThrow throws error for workflow with multiple calls to a
             analysis:
               runs-on: ubuntu-latest
               steps:
-                - uses: actions/checkout@v3
-                - uses: github/codeql-action/init@v3
-                - uses: github/codeql-action/analyze@v3
+                - uses: actions/checkout@v4
+                - uses: github/codeql-action/init@v4
+                - uses: github/codeql-action/analyze@v4
                   with:
                     category: some-category
-                - uses: github/codeql-action/analyze@v3
+                - uses: github/codeql-action/analyze@v4
                   with:
                     category: another-category
         `) as Workflow,

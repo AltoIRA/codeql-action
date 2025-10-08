@@ -6,17 +6,22 @@ import { TestFn } from "ava";
 import nock from "nock";
 import * as sinon from "sinon";
 
+import { getActionVersion } from "./actions-util";
+import { AnalysisKind } from "./analyses";
 import * as apiClient from "./api-client";
 import { GitHubApiDetails } from "./api-client";
+import { CachingKind } from "./caching-utils";
 import * as codeql from "./codeql";
 import { Config } from "./config-utils";
 import * as defaults from "./defaults.json";
 import {
   CodeQLDefaultVersionInfo,
   Feature,
+  featureConfig,
   FeatureEnablement,
 } from "./feature-flags";
 import { Logger } from "./logging";
+import { OverlayDatabaseMode } from "./overlay-database-utils";
 import {
   DEFAULT_DEBUG_ARTIFACT_NAME,
   DEFAULT_DEBUG_DATABASE_NAME,
@@ -180,6 +185,21 @@ export function mockFeatureFlagApiEndpoint(
   responseStatusCode: number,
   response: { [flagName: string]: boolean },
 ) {
+  stubFeatureFlagApiEndpoint(() => ({
+    status: responseStatusCode,
+    messageIfError: "some error message",
+    data: response,
+  }));
+}
+
+/** Stub the HTTP request to the feature flags enablement API endpoint. */
+export function stubFeatureFlagApiEndpoint(
+  responseFunction: (params: any) => {
+    status: number;
+    messageIfError?: string;
+    data: { [flagName: string]: boolean };
+  },
+) {
   // Passing an auth token is required, so we just use a dummy value
   const client = github.getOctokit("123");
 
@@ -188,16 +208,23 @@ export function mockFeatureFlagApiEndpoint(
   const optInSpy = requestSpy.withArgs(
     "GET /repos/:owner/:repo/code-scanning/codeql-action/features",
   );
-  if (responseStatusCode < 300) {
-    optInSpy.resolves({
-      status: responseStatusCode,
-      data: response,
-      headers: {},
-      url: "GET /repos/:owner/:repo/code-scanning/codeql-action/features",
-    });
-  } else {
-    optInSpy.throws(new HTTPError("some error message", responseStatusCode));
-  }
+
+  optInSpy.callsFake((_route, params) => {
+    const response = responseFunction(params);
+    if (response.status < 300) {
+      return Promise.resolve({
+        status: response.status,
+        data: response.data,
+        headers: {},
+        url: "GET /repos/:owner/:repo/code-scanning/codeql-action/features",
+      });
+    } else {
+      throw new HTTPError(
+        response.messageIfError || "default stub error message",
+        response.status,
+      );
+    }
+  });
 
   sinon.stub(apiClient, "getApiClient").value(() => client);
 }
@@ -231,18 +258,21 @@ export function mockLanguagesInRepo(languages: string[]) {
 export const makeVersionInfo = (
   version: string,
   features?: { [name: string]: boolean },
+  overlayVersion?: number,
 ): codeql.VersionInfo => ({
   version,
   features,
+  overlayVersion,
 });
 
 export function mockCodeQLVersion(
   version: string,
   features?: { [name: string]: boolean },
+  overlayVersion?: number,
 ) {
-  return codeql.setCodeQL({
+  return codeql.createStubCodeQL({
     async getVersion() {
-      return makeVersionInfo(version, features);
+      return makeVersionInfo(version, features, overlayVersion);
     },
   });
 }
@@ -261,6 +291,13 @@ export function createFeatures(enabledFeatures: Feature[]): FeatureEnablement {
       return enabledFeatures.includes(feature);
     },
   };
+}
+
+export function initializeFeatures(initialValue: boolean) {
+  return Object.keys(featureConfig).reduce((features, key) => {
+    features[key] = initialValue;
+    return features;
+  }, {});
 }
 
 /**
@@ -286,36 +323,46 @@ export function mockBundleDownloadApi({
     process.platform === "win32"
       ? "win64"
       : process.platform === "linux"
-      ? "linux64"
-      : "osx64";
+        ? "linux64"
+        : "osx64";
 
   const baseUrl = apiDetails?.url ?? "https://example.com";
-  const relativeUrl = apiDetails
-    ? `/${repo}/releases/download/${tagName}/codeql-bundle${
-        platformSpecific ? `-${platform}` : ""
-      }.tar.gz`
-    : `/download/${tagName}/codeql-bundle.tar.gz`;
 
-  nock(baseUrl)
-    .get(relativeUrl)
-    .replyWithFile(
-      200,
-      path.join(
-        __dirname,
-        `/../src/testdata/codeql-bundle${isPinned ? "-pinned" : ""}.tar.gz`,
-      ),
-    );
+  const bundleUrls = ["tar.gz", "tar.zst"].map((extension) => {
+    const relativeUrl = apiDetails
+      ? `/${repo}/releases/download/${tagName}/codeql-bundle${
+          platformSpecific ? `-${platform}` : ""
+        }.${extension}`
+      : `/download/${tagName}/codeql-bundle.${extension}`;
 
-  return `${baseUrl}${relativeUrl}`;
+    nock(baseUrl)
+      .get(relativeUrl)
+      .replyWithFile(
+        200,
+        path.join(
+          __dirname,
+          `/../src/testdata/codeql-bundle${
+            isPinned ? "-pinned" : ""
+          }.${extension}`,
+        ),
+      );
+    return `${baseUrl}${relativeUrl}`;
+  });
+
+  // Choose an arbitrary URL to return
+  return bundleUrls[0];
 }
 
 export function createTestConfig(overrides: Partial<Config>): Config {
   return Object.assign(
     {},
     {
+      version: getActionVersion(),
+      analysisKinds: [AnalysisKind.CodeScanning],
       languages: [],
       buildMode: undefined,
       originalUserInput: {},
+      computedConfig: {},
       tempDir: "",
       codeQLCmd: "",
       gitHubVersion: {
@@ -325,13 +372,14 @@ export function createTestConfig(overrides: Partial<Config>): Config {
       debugMode: false,
       debugArtifactName: DEFAULT_DEBUG_ARTIFACT_NAME,
       debugDatabaseName: DEFAULT_DEBUG_DATABASE_NAME,
-      augmentationProperties: {
-        packsInputCombines: false,
-        queriesInputCombines: false,
-      },
       trapCaches: {},
       trapCacheDownloadTime: 0,
-    },
+      dependencyCachingEnabled: CachingKind.None,
+      extraQueryExclusions: [],
+      overlayDatabaseMode: OverlayDatabaseMode.None,
+      useOverlayDatabaseCaching: false,
+      repositoryProperties: {},
+    } satisfies Config,
     overrides,
   );
 }

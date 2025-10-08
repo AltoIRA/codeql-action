@@ -5,13 +5,19 @@ import * as actionsCache from "@actions/cache";
 
 import * as actionsUtil from "./actions-util";
 import * as apiClient from "./api-client";
-import { CodeQL } from "./codeql";
-import type { Config } from "./config-utils";
+import { type CodeQL } from "./codeql";
+import { type Config } from "./config-utils";
 import { DocUrl } from "./doc-url";
 import { Feature, FeatureEnablement } from "./feature-flags";
+import * as gitUtils from "./git-utils";
 import { Language } from "./languages";
 import { Logger } from "./logging";
-import { isHTTPError, tryGetFolderBytes, withTimeout, wrapError } from "./util";
+import {
+  getErrorMessage,
+  isHTTPError,
+  tryGetFolderBytes,
+  waitForResultWithTimeLimit,
+} from "./util";
 
 // This constant should be bumped if we make a breaking change
 // to how the CodeQL Action stores or retrieves the TRAP cache,
@@ -44,8 +50,8 @@ export async function downloadTrapCaches(
   codeql: CodeQL,
   languages: Language[],
   logger: Logger,
-): Promise<Partial<Record<Language, string>>> {
-  const result: Partial<Record<Language, string>> = {};
+): Promise<{ [language: string]: string }> {
+  const result: { [language: string]: string } = {};
   const languagesSupportingCaching = await getLanguagesSupportingCaching(
     codeql,
     languages,
@@ -66,7 +72,7 @@ export async function downloadTrapCaches(
     result[language] = cacheDir;
   }
 
-  if (await actionsUtil.isAnalyzingDefaultBranch()) {
+  if (await gitUtils.isAnalyzingDefaultBranch()) {
     logger.info(
       "Analyzing default branch. Skipping downloading of TRAP caches.",
     );
@@ -90,7 +96,7 @@ export async function downloadTrapCaches(
     logger.info(
       `Looking in Actions cache for TRAP cache with key ${preferredKey}`,
     );
-    const found = await withTimeout(
+    const found = await waitForResultWithTimeLimit(
       MAX_CACHE_OPERATION_MS,
       actionsCache.restoreCache([cacheDir], preferredKey, [
         // Fall back to any cache with the right key prefix
@@ -126,7 +132,7 @@ export async function uploadTrapCaches(
   config: Config,
   logger: Logger,
 ): Promise<boolean> {
-  if (!(await actionsUtil.isAnalyzingDefaultBranch())) return false; // Only upload caches from the default branch
+  if (!(await gitUtils.isAnalyzingDefaultBranch())) return false; // Only upload caches from the default branch
 
   for (const language of config.languages) {
     const cacheDir = config.trapCaches[language];
@@ -150,7 +156,7 @@ export async function uploadTrapCaches(
       process.env.GITHUB_SHA || "unknown",
     );
     logger.info(`Uploading TRAP cache to Actions cache with key ${key}`);
-    await withTimeout(
+    await waitForResultWithTimeLimit(
       MAX_CACHE_OPERATION_MS,
       actionsCache.saveCache([cacheDir], key),
       () => {
@@ -179,7 +185,7 @@ export async function cleanupTrapCaches(
       trap_cache_cleanup_skipped_because: "feature disabled",
     };
   }
-  if (!(await actionsUtil.isAnalyzingDefaultBranch())) {
+  if (!(await gitUtils.isAnalyzingDefaultBranch())) {
     return {
       trap_cache_cleanup_skipped_because: "not analyzing default branch",
     };
@@ -190,7 +196,7 @@ export async function cleanupTrapCaches(
 
     const allCaches = await apiClient.listActionsCaches(
       CODEQL_TRAP_CACHE_PREFIX,
-      await actionsUtil.getRef(),
+      await gitUtils.getRef(),
     );
 
     for (const language of config.languages) {
@@ -239,7 +245,7 @@ export async function cleanupTrapCaches(
     } else {
       logger.info(`Failed to cleanup TRAP caches, continuing. Details: ${e}`);
     }
-    return { trap_cache_cleanup_error: wrapError(e).message };
+    return { trap_cache_cleanup_error: getErrorMessage(e) };
   }
 }
 
@@ -305,18 +311,6 @@ export async function getLanguagesSupportingCaching(
     result.push(lang);
   }
   return result;
-}
-
-export async function getTotalCacheSize(
-  trapCaches: Partial<Record<Language, string>>,
-  logger: Logger,
-): Promise<number> {
-  const sizes = await Promise.all(
-    Object.values(trapCaches).map((cacheDir) =>
-      tryGetFolderBytes(cacheDir, logger),
-    ),
-  );
-  return sizes.map((a) => a || 0).reduce((a, b) => a + b, 0);
 }
 
 async function cacheKey(

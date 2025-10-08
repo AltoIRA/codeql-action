@@ -2,15 +2,17 @@ import * as fs from "fs";
 
 import * as actionsUtil from "./actions-util";
 import { getApiClient, GitHubApiDetails } from "./api-client";
-import { getCodeQL } from "./codeql";
+import { type CodeQL } from "./codeql";
 import { Config } from "./config-utils";
-import { Logger } from "./logging";
+import * as gitUtils from "./git-utils";
+import { Logger, withGroupAsync } from "./logging";
 import { RepositoryNwo } from "./repository";
 import * as util from "./util";
 import { bundleDb, parseGitHubUrl } from "./util";
 
 export async function uploadDatabases(
   repositoryNwo: RepositoryNwo,
+  codeql: CodeQL,
   config: Config,
   apiDetails: GitHubApiDetails,
   logger: Logger,
@@ -34,14 +36,19 @@ export async function uploadDatabases(
     return;
   }
 
-  if (!(await actionsUtil.isAnalyzingDefaultBranch())) {
+  if (!(await gitUtils.isAnalyzingDefaultBranch())) {
     // We only want to upload a database if we are analyzing the default branch.
     logger.debug("Not analyzing default branch. Skipping upload.");
     return;
   }
 
+  // Clean up the database, since intermediate results may still be written to the
+  // database if there is high RAM pressure.
+  await withGroupAsync("Cleaning up databases", async () => {
+    await codeql.databaseCleanupCluster(config, "clear");
+  });
+
   const client = getApiClient();
-  const codeql = await getCodeQL(config.codeQLCmd);
 
   const uploadsUrl = new URL(parseGitHubUrl(apiDetails.url));
   uploadsUrl.hostname = `uploads.${uploadsUrl.hostname}`;
@@ -62,7 +69,7 @@ export async function uploadDatabases(
       const bundledDb = await bundleDb(config, language, codeql, language);
       const bundledDbSize = fs.statSync(bundledDb).size;
       const bundledDbReadStream = fs.createReadStream(bundledDb);
-      const commitOid = await actionsUtil.getCommitOid(
+      const commitOid = await gitUtils.getCommitOid(
         actionsUtil.getRequiredInput("checkout_path"),
       );
       try {

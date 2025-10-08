@@ -5,17 +5,22 @@ import * as core from "@actions/core";
 import {
   getWorkflowEventName,
   getOptionalInput,
-  getRef,
   getWorkflowRunID,
   getWorkflowRunAttempt,
   getActionVersion,
   getRequiredInput,
+  isSelfHostedRunner,
 } from "./actions-util";
 import { getAnalysisKey, getApiClient } from "./api-client";
-import { type Config } from "./config-utils";
+import { parseRegistriesWithoutCredentials, type Config } from "./config-utils";
+import { DependencyCacheRestoreStatusReport } from "./dependency-caching";
 import { DocUrl } from "./doc-url";
 import { EnvVar } from "./environment";
+import { getRef } from "./git-utils";
 import { Logger } from "./logging";
+import { OverlayBaseDatabaseDownloadStats } from "./overlay-database-utils";
+import { getRepositoryNwo } from "./repository";
+import { ToolsSource } from "./setup-codeql";
 import {
   ConfigurationError,
   isHTTPError,
@@ -26,15 +31,17 @@ import {
   DiskUsage,
   assertNever,
   BuildMode,
-  wrapError,
+  getErrorMessage,
+  getTestingEnvironment,
 } from "./util";
 
 export enum ActionName {
-  Autobuild = "autobuild",
   Analyze = "finish",
+  Autobuild = "autobuild",
   Init = "init",
   InitPost = "init-post",
   ResolveEnvironment = "resolve-environment",
+  StartProxy = "start-proxy",
   UploadSarif = "upload-sarif",
 }
 
@@ -51,6 +58,13 @@ export function isFirstPartyAnalysis(actionName: ActionName): boolean {
     return true;
   }
   return process.env[EnvVar.INIT_ACTION_HAS_RUN] === "true";
+}
+
+/**
+ * @returns true if the analysis is considered to be third party.
+ */
+export function isThirdPartyAnalysis(actionName: ActionName): boolean {
+  return !isFirstPartyAnalysis(actionName);
 }
 
 export type ActionStatus =
@@ -81,6 +95,8 @@ export interface StatusReportBase {
   action_version: string;
   /** The name of the Actions event that triggered the workflow. */
   actions_event_name?: string;
+  /** Comma-separated list of the kinds of analyses we are performing. */
+  analysis_kinds?: string;
   /** Analysis key, normally composed from the workflow path and job name. */
   analysis_key: string;
   /** Build mode, if specified. */
@@ -244,7 +260,7 @@ export async function createStatusReportBase(
   actionName: ActionName,
   status: ActionStatus,
   actionStartedAt: Date,
-  config: Config | undefined,
+  config: Partial<Config> | undefined,
   diskInfo: DiskUsage | undefined,
   logger: Logger,
   cause?: string,
@@ -268,10 +284,10 @@ export async function createStatusReportBase(
     const runnerOs = getRequiredEnvParam("RUNNER_OS");
     const codeQlCliVersion = getCachedCodeQlVersion();
     const actionRef = process.env["GITHUB_ACTION_REF"] || "";
-    const testingEnvironment = process.env[EnvVar.TESTING_ENVIRONMENT] || "";
+    const testingEnvironment = getTestingEnvironment();
     // re-export the testing environment variable so that it is available to subsequent steps,
     // even if it was only set for this step
-    if (testingEnvironment !== "") {
+    if (testingEnvironment) {
       core.exportVariable(EnvVar.TESTING_ENVIRONMENT, testingEnvironment);
     }
     const isSteadyStateDefaultSetupRun =
@@ -283,6 +299,7 @@ export async function createStatusReportBase(
       action_ref: actionRef,
       action_started_at: actionStartedAt.toISOString(),
       action_version: getActionVersion(),
+      analysis_kinds: config?.analysisKinds?.join(","),
       analysis_key,
       build_mode: config?.buildMode,
       commit_oid: commitOid,
@@ -294,7 +311,7 @@ export async function createStatusReportBase(
       started_at: workflowStartedAt,
       status,
       steady_state_default_setup: isSteadyStateDefaultSetupRun,
-      testing_environment: testingEnvironment,
+      testing_environment: testingEnvironment || "",
       workflow_name: workflowName,
       workflow_run_attempt: workflowRunAttempt,
       workflow_run_id: workflowRunID,
@@ -307,7 +324,7 @@ export async function createStatusReportBase(
     }
 
     if (config) {
-      statusReport.languages = config.languages.join(",");
+      statusReport.languages = config.languages?.join(",");
     }
 
     if (diskInfo) {
@@ -340,7 +357,9 @@ export async function createStatusReportBase(
       // Values other than X86, X64, ARM, or ARM64 are discarded server side
       statusReport.runner_arch = process.env["RUNNER_ARCH"];
     }
-    if (runnerOs === "Windows" || runnerOs === "macOS") {
+    if (!(runnerOs === "Linux" && isSelfHostedRunner())) {
+      // We do not report the release number for Linux self-hosted runners
+      // because the custom build suffix may be private customer information.
       statusReport.runner_os_release = os.release();
     }
     if (codeQlCliVersion !== undefined) {
@@ -356,6 +375,12 @@ export async function createStatusReportBase(
     logger.warning(
       `Caught an exception while gathering information for telemetry: ${e}. Will skip sending status report.`,
     );
+
+    // Re-throw the exception in test mode. While testing, we want to know if something goes wrong here.
+    if (isInTestMode()) {
+      throw e;
+    }
+
     return undefined;
   }
 }
@@ -390,16 +415,15 @@ export async function sendStatusReport<S extends StatusReportBase>(
     return;
   }
 
-  const nwo = getRequiredEnvParam("GITHUB_REPOSITORY");
-  const [owner, repo] = nwo.split("/");
+  const nwo = getRepositoryNwo();
   const client = getApiClient();
 
   try {
     await client.request(
       "PUT /repos/:owner/:repo/code-scanning/analysis/status",
       {
-        owner,
-        repo,
+        owner: nwo.owner,
+        repo: nwo.repo,
         data: statusReportJSON,
       },
     );
@@ -440,9 +464,129 @@ export async function sendStatusReport<S extends StatusReportBase>(
     // something else has gone wrong and the request/response will be logged by octokit
     // it's possible this is a transient error and we should continue scanning
     core.warning(
-      `An unexpected error occurred when sending code scanning status report: ${
-        wrapError(e).message
-      }`,
+      `An unexpected error occurred when sending code scanning status report: ${getErrorMessage(
+        e,
+      )}`,
     );
   }
+}
+
+/** Fields of the init status report that can be sent before `config` is populated. */
+export interface InitStatusReport extends StatusReportBase {
+  /** Value given by the user as the "tools" input. */
+  tools_input: string;
+  /** Version of the bundle used. */
+  tools_resolved_version: string;
+  /** Where the bundle originated from. */
+  tools_source: ToolsSource;
+  /** Comma-separated list of languages specified explicitly in the workflow file. */
+  workflow_languages: string;
+}
+
+/** Fields of the init status report that are populated using values from `config`. */
+export interface InitWithConfigStatusReport extends InitStatusReport {
+  /** Comma-separated list of languages where the default queries are disabled. */
+  disable_default_queries: string;
+  /** Comma-separated list of paths, from the 'paths' config field. */
+  paths: string;
+  /** Comma-separated list of paths, from the 'paths-ignore' config field. */
+  paths_ignore: string;
+  /** Comma-separated list of queries sources, from the 'queries' config field or workflow input. */
+  queries: string;
+  /** Stringified JSON object of packs, from the 'packs' config field or workflow input. */
+  packs: string;
+  /** Comma-separated list of languages for which we are using TRAP caching. */
+  trap_cache_languages: string;
+  /** Size of TRAP caches that we downloaded, in bytes. */
+  trap_cache_download_size_bytes: number;
+  /** Time taken to download TRAP caches, in milliseconds. */
+  trap_cache_download_duration_ms: number;
+  /** Size of the overlay-base database that we downloaded, in bytes. */
+  overlay_base_database_download_size_bytes?: number;
+  /** Time taken to download the overlay-base database, in milliseconds. */
+  overlay_base_database_download_duration_ms?: number;
+  /** Stringified JSON object representing information about the results of restoring dependency caches. */
+  dependency_caching_restore_results?: DependencyCacheRestoreStatusReport;
+  /** Stringified JSON array of registry configuration objects, from the 'registries' config field
+  or workflow input. **/
+  registries: string;
+  /** Stringified JSON object representing a query-filters, from the 'query-filters' config field. **/
+  query_filters: string;
+  /** Path to the specified code scanning config file, from the 'config-file' config field. */
+  config_file: string;
+}
+
+/**
+ * Composes a `InitWithConfigStatusReport` from the given values.
+ *
+ * @param config The CodeQL Action configuration whose values should be added to the base status report.
+ * @param initStatusReport The base status report.
+ * @param configFile Optionally, the filename of the configuration file that was read.
+ * @param totalCacheSize The computed total TRAP cache size.
+ * @param overlayBaseDatabaseStats Statistics about the overlay database, if any.
+ * @returns
+ */
+export async function createInitWithConfigStatusReport(
+  config: Config,
+  initStatusReport: InitStatusReport,
+  configFile: string | undefined,
+  totalCacheSize: number,
+  overlayBaseDatabaseStats: OverlayBaseDatabaseDownloadStats | undefined,
+  dependencyCachingResults: DependencyCacheRestoreStatusReport | undefined,
+): Promise<InitWithConfigStatusReport> {
+  const languages = config.languages.join(",");
+  const paths = (config.originalUserInput.paths || []).join(",");
+  const pathsIgnore = (config.originalUserInput["paths-ignore"] || []).join(
+    ",",
+  );
+  const disableDefaultQueries = config.originalUserInput[
+    "disable-default-queries"
+  ]
+    ? languages
+    : "";
+
+  const queries: string[] = [];
+  let queriesInput = getOptionalInput("queries")?.trim();
+  if (queriesInput === undefined || queriesInput.startsWith("+")) {
+    queries.push(
+      ...(config.originalUserInput.queries || []).map((q) => q.uses),
+    );
+  }
+  if (queriesInput !== undefined) {
+    queriesInput = queriesInput.startsWith("+")
+      ? queriesInput.slice(1)
+      : queriesInput;
+    queries.push(...queriesInput.split(","));
+  }
+
+  let packs: Record<string, string[]> = {};
+  if (Array.isArray(config.computedConfig.packs)) {
+    packs[config.languages[0]] = config.computedConfig.packs;
+  } else if (config.computedConfig.packs !== undefined) {
+    packs = config.computedConfig.packs;
+  }
+
+  return {
+    ...initStatusReport,
+    config_file: configFile ?? "",
+    disable_default_queries: disableDefaultQueries,
+    paths,
+    paths_ignore: pathsIgnore,
+    queries: queries.join(","),
+    packs: JSON.stringify(packs),
+    trap_cache_languages: Object.keys(config.trapCaches).join(","),
+    trap_cache_download_size_bytes: totalCacheSize,
+    trap_cache_download_duration_ms: Math.round(config.trapCacheDownloadTime),
+    overlay_base_database_download_size_bytes:
+      overlayBaseDatabaseStats?.databaseSizeBytes,
+    overlay_base_database_download_duration_ms:
+      overlayBaseDatabaseStats?.databaseDownloadDurationMs,
+    dependency_caching_restore_results: dependencyCachingResults,
+    query_filters: JSON.stringify(
+      config.originalUserInput["query-filters"] ?? [],
+    ),
+    registries: JSON.stringify(
+      parseRegistriesWithoutCredentials(getOptionalInput("registries")) ?? [],
+    ),
+  };
 }

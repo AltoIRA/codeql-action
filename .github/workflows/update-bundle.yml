@@ -13,10 +13,17 @@ on:
     # to filter pre-release attribute.
     types: [published]
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   update-bundle:
     if: github.event.release.prerelease && startsWith(github.event.release.tag_name, 'codeql-bundle-')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed to push commits
+      pull-requests: write # needed to create pull requests
     steps:
       - name: Dump environment
         run: env
@@ -26,12 +33,21 @@ jobs:
           GITHUB_CONTEXT: '${{ toJson(github) }}'
         run: echo "$GITHUB_CONTEXT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Update git config
         run: |
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: Update bundle
         uses: ./.github/actions/update-bundle

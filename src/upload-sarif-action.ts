@@ -2,26 +2,28 @@ import * as core from "@actions/core";
 
 import * as actionsUtil from "./actions-util";
 import { getActionVersion, getTemporaryDirectory } from "./actions-util";
+import * as analyses from "./analyses";
 import { getGitHubVersion } from "./api-client";
 import { Features } from "./feature-flags";
 import { Logger, getActionsLogger } from "./logging";
-import { parseRepositoryNwo } from "./repository";
+import { getRepositoryNwo } from "./repository";
 import {
   createStatusReportBase,
   sendStatusReport,
   StatusReportBase,
   getActionsStatus,
   ActionName,
-  isFirstPartyAnalysis,
+  isThirdPartyAnalysis,
 } from "./status-report";
 import * as upload_lib from "./upload-lib";
+import { uploadSarif } from "./upload-sarif";
 import {
   ConfigurationError,
   checkActionVersion,
   checkDiskUsage,
-  getRequiredEnvParam,
+  getErrorMessage,
   initializeEnvironment,
-  isInTestMode,
+  shouldSkipSarifUpload,
   wrapError,
 } from "./util";
 
@@ -39,7 +41,7 @@ async function sendSuccessStatusReport(
     "success",
     startedAt,
     undefined,
-    await checkDiskUsage(),
+    await checkDiskUsage(logger),
     logger,
   );
   if (statusReportBase !== undefined) {
@@ -59,9 +61,10 @@ async function run() {
   const gitHubVersion = await getGitHubVersion();
   checkActionVersion(getActionVersion(), gitHubVersion);
 
-  const repositoryNwo = parseRepositoryNwo(
-    getRequiredEnvParam("GITHUB_REPOSITORY"),
-  );
+  // Make inputs accessible in the `post` step.
+  actionsUtil.persistInputs();
+
+  const repositoryNwo = getRepositoryNwo();
   const features = new Features(
     gitHubVersion,
     repositoryNwo,
@@ -74,7 +77,7 @@ async function run() {
     "starting",
     startedAt,
     undefined,
-    await checkDiskUsage(),
+    await checkDiskUsage(logger),
     logger,
   );
   if (startingStatusReportBase !== undefined) {
@@ -82,29 +85,57 @@ async function run() {
   }
 
   try {
-    const uploadResult = await upload_lib.uploadFiles(
-      actionsUtil.getRequiredInput("sarif_file"),
-      actionsUtil.getRequiredInput("checkout_path"),
-      actionsUtil.getOptionalInput("category"),
-      features,
-      logger,
-    );
-    core.setOutput("sarif-id", uploadResult.sarifID);
+    // `sarifPath` can either be a path to a single file, or a path to a directory.
+    const sarifPath = actionsUtil.getRequiredInput("sarif_file");
+    const checkoutPath = actionsUtil.getRequiredInput("checkout_path");
+    const category = actionsUtil.getOptionalInput("category");
 
-    // We don't upload results in test mode, so don't wait for processing
-    if (isInTestMode()) {
-      core.debug("In test mode. Waiting for processing is disabled.");
-    } else if (actionsUtil.getRequiredInput("wait-for-processing") === "true") {
-      await upload_lib.waitForProcessing(
-        parseRepositoryNwo(getRequiredEnvParam("GITHUB_REPOSITORY")),
-        uploadResult.sarifID,
-        logger,
+    const uploadResults = await uploadSarif(
+      logger,
+      features,
+      checkoutPath,
+      sarifPath,
+      category,
+    );
+
+    // Fail if we didn't upload anything.
+    if (Object.keys(uploadResults).length === 0) {
+      throw new ConfigurationError(
+        `No SARIF files found to upload in "${sarifPath}".`,
       );
     }
-    await sendSuccessStatusReport(startedAt, uploadResult.statusReport, logger);
+
+    const codeScanningResult =
+      uploadResults[analyses.AnalysisKind.CodeScanning];
+    if (codeScanningResult !== undefined) {
+      core.setOutput("sarif-id", codeScanningResult.sarifID);
+    }
+    core.setOutput("sarif-ids", JSON.stringify(uploadResults));
+
+    // We don't upload results in test mode, so don't wait for processing
+    if (shouldSkipSarifUpload()) {
+      core.debug(
+        "SARIF upload disabled by an environment variable. Waiting for processing is disabled.",
+      );
+    } else if (actionsUtil.getRequiredInput("wait-for-processing") === "true") {
+      if (codeScanningResult !== undefined) {
+        await upload_lib.waitForProcessing(
+          getRepositoryNwo(),
+          codeScanningResult.sarifID,
+          logger,
+        );
+      }
+      // The code quality service does not currently have an endpoint to wait for SARIF processing,
+      // so we can't wait for that here.
+    }
+    await sendSuccessStatusReport(
+      startedAt,
+      codeScanningResult?.statusReport || {},
+      logger,
+    );
   } catch (unwrappedError) {
     const error =
-      !isFirstPartyAnalysis(ActionName.UploadSarif) &&
+      isThirdPartyAnalysis(ActionName.UploadSarif) &&
       unwrappedError instanceof upload_lib.InvalidSarifUploadError
         ? new ConfigurationError(unwrappedError.message)
         : wrapError(unwrappedError);
@@ -116,7 +147,7 @@ async function run() {
       getActionsStatus(error),
       startedAt,
       undefined,
-      await checkDiskUsage(),
+      await checkDiskUsage(logger),
       logger,
       message,
       error.stack,
@@ -133,7 +164,7 @@ async function runWrapper() {
     await run();
   } catch (error) {
     core.setFailed(
-      `codeql/upload-sarif action failed: ${wrapError(error).message}`,
+      `codeql/upload-sarif action failed: ${getErrorMessage(error)}`,
     );
   }
 }

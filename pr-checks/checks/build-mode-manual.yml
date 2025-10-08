@@ -1,7 +1,7 @@
 name: "Build mode manual"
 description: "An end-to-end integration test of a Java repository built using 'build-mode: manual'"
-operatingSystems: ["ubuntu"]
 versions: ["nightly-latest"]
+installGo: true
 steps:
   - uses: ./../action/init
     id: init
@@ -20,12 +20,7 @@ steps:
         exit 1
       fi
 
-  - uses: ./../action/.github/actions/setup-swift
-    with:
-      codeql-path: ${{ steps.init.outputs.codeql-path }}
-
   - name: Build code
-    shell: bash
     run: ./build.sh
 
   - uses: ./../action/analyze

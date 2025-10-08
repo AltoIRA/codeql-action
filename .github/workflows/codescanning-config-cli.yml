@@ -3,6 +3,9 @@
 name: Code-Scanning config CLI tests
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # Diff informed queries add an additional query filter which is not yet
+  # taken into account by these tests.
+  CODEQL_ACTION_DIFF_INFORMED_QUERIES: false
 
 on:
   push:
@@ -19,9 +22,19 @@ on:
     - cron: '0 5 * * *'
   workflow_dispatch: {}
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   code-scanning-config-tests:
+    if: github.triggering_actor != 'dependabot[bot]'
     continue-on-error: true
+
+    permissions:
+      contents: read
+      packages: read
+      security-events: read
 
     strategy:
       fail-fast: false
@@ -29,15 +42,9 @@ jobs:
         include:
         - os: ubuntu-latest
           version: linked
-        - os: macos-latest
-          version: linked
         - os: ubuntu-latest
           version: default
-        - os: macos-latest
-          version: default
         - os: ubuntu-latest
-          version: nightly-latest
-        - os: macos-latest
           version: nightly-latest
 
     # Code-Scanning config not created because environment variable is not set
@@ -46,7 +53,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - name: Check out repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v5
+      with:
+        node-version: 24
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
     - name: Prepare test
       id: prepare-test
       uses: ./.github/actions/prepare-test
@@ -158,13 +175,13 @@ jobs:
       with:
         expected-config-file-contents: |
           {
-            "queries": [
-              { "uses": "./codeql-qlpacks/complex-javascript-qlpack/foo2/show_ifs.ql" },
-              { "uses": "./codeql-qlpacks/complex-javascript-qlpack/show_ifs.ql" }
-            ],
             "packs": {
               "javascript": ["codeql-testing/codeql-pack1@1.0.0", "codeql-testing/codeql-pack2", "codeql/javascript-queries" ]
-            }
+            },
+            "queries": [
+              { "uses": "./codeql-qlpacks/complex-javascript-qlpack/show_ifs.ql" },
+              { "uses": "./codeql-qlpacks/complex-javascript-qlpack/foo2/show_ifs.ql" }
+            ]
           }
         languages: javascript
         queries: + ./codeql-qlpacks/complex-javascript-qlpack/show_ifs.ql

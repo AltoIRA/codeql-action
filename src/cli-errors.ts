@@ -1,21 +1,27 @@
+import {
+  CommandInvocationError,
+  ensureEndsInPeriod,
+  prettyPrintInvocation,
+} from "./actions-util";
 import { DocUrl } from "./doc-url";
 import { ConfigurationError } from "./util";
 
+const SUPPORTED_PLATFORMS = [
+  ["linux", "x64"],
+  ["win32", "x64"],
+  ["darwin", "x64"],
+  ["darwin", "arm64"],
+];
+
 /**
- * A class of Error that we can classify as an error stemming from a CLI
- * invocation, with associated exit code, stderr,etc.
+ * An error from a CodeQL CLI invocation, with associated exit code, stderr, etc.
  */
-export class CommandInvocationError extends Error {
-  constructor(
-    cmd: string,
-    args: string[],
-    public exitCode: number,
-    public stderr: string,
-    public stdout: string,
-  ) {
-    const prettyCommand = [cmd, ...args]
-      .map((x) => (x.includes(" ") ? `'${x}'` : x))
-      .join(" ");
+export class CliError extends Error {
+  public readonly exitCode: number | undefined;
+  public readonly stderr: string;
+
+  constructor({ cmd, args, exitCode, stderr }: CommandInvocationError) {
+    const prettyCommand = prettyPrintInvocation(cmd, args);
 
     const fatalErrors = extractFatalErrors(stderr);
     const autobuildErrors = extractAutobuildErrors(stderr);
@@ -42,6 +48,8 @@ export class CommandInvocationError extends Error {
     }
 
     super(message);
+    this.exitCode = exitCode;
+    this.stderr = stderr;
   }
 }
 
@@ -115,18 +123,16 @@ function extractAutobuildErrors(error: string): string | undefined {
   return errorLines.join("\n") || undefined;
 }
 
-function ensureEndsInPeriod(text: string): string {
-  return text[text.length - 1] === "." ? text : `${text}.`;
-}
-
 /** Error messages from the CLI that we consider configuration errors and handle specially. */
 export enum CliConfigErrorCategory {
   AutobuildError = "AutobuildError",
+  CouldNotCreateTempDir = "CouldNotCreateTempDir",
   ExternalRepositoryCloneFailed = "ExternalRepositoryCloneFailed",
   GradleBuildFailed = "GradleBuildFailed",
   IncompatibleWithActionVersion = "IncompatibleWithActionVersion",
   InitCalledTwice = "InitCalledTwice",
   InvalidConfigFile = "InvalidConfigFile",
+  InvalidExternalRepoSpecifier = "InvalidExternalRepoSpecifier",
   InvalidSourceRoot = "InvalidSourceRoot",
   MavenBuildFailed = "MavenBuildFailed",
   NoBuildCommandAutodetected = "NoBuildCommandAutodetected",
@@ -134,6 +140,7 @@ export enum CliConfigErrorCategory {
   NoSourceCodeSeen = "NoSourceCodeSeen",
   NoSupportedBuildCommandSucceeded = "NoSupportedBuildCommandSucceeded",
   NoSupportedBuildSystemDetected = "NoSupportedBuildSystemDetected",
+  NotFoundInRegistry = "NotFoundInRegistry",
   OutOfMemoryOrDisk = "OutOfMemoryOrDisk",
   PackCannotBeFound = "PackCannotBeFound",
   PackMissingAuth = "PackMissingAuth",
@@ -161,6 +168,9 @@ export const cliErrorsConfig: Record<
       new RegExp("We were unable to automatically build your code"),
     ],
   },
+  [CliConfigErrorCategory.CouldNotCreateTempDir]: {
+    cliErrorMessageCandidates: [new RegExp("Could not create temp directory")],
+  },
   [CliConfigErrorCategory.ExternalRepositoryCloneFailed]: {
     cliErrorMessageCandidates: [
       new RegExp("Failed to clone external Git repository"),
@@ -168,7 +178,7 @@ export const cliErrorsConfig: Record<
   },
   [CliConfigErrorCategory.GradleBuildFailed]: {
     cliErrorMessageCandidates: [
-      new RegExp("[autobuild] FAILURE: Build failed with an exception."),
+      new RegExp("\\[autobuild\\] FAILURE: Build failed with an exception."),
     ],
   },
   // Version of CodeQL CLI is incompatible with this version of the CodeQL Action
@@ -189,6 +199,11 @@ export const cliErrorsConfig: Record<
     cliErrorMessageCandidates: [
       new RegExp("Config file .* is not valid"),
       new RegExp("The supplied config file is empty"),
+    ],
+  },
+  [CliConfigErrorCategory.InvalidExternalRepoSpecifier]: {
+    cliErrorMessageCandidates: [
+      new RegExp("Specifier for external repository is invalid"),
     ],
   },
   // Expected source location for database creation does not exist
@@ -273,6 +288,11 @@ export const cliErrorsConfig: Record<
       ),
     ],
   },
+  [CliConfigErrorCategory.NotFoundInRegistry]: {
+    cliErrorMessageCandidates: [
+      new RegExp("'.*' not found in the registry '.*'"),
+    ],
+  },
 };
 
 /**
@@ -281,8 +301,8 @@ export const cliErrorsConfig: Record<
  * the error messages in the config record, or the exit codes match, return the error category;
  * if not, return undefined.
  */
-export function getCliConfigCategoryIfExists(
-  cliError: CommandInvocationError,
+function getCliConfigCategoryIfExists(
+  cliError: CliError,
 ): CliConfigErrorCategory | undefined {
   for (const [category, configuration] of Object.entries(cliErrorsConfig)) {
     if (
@@ -304,13 +324,35 @@ export function getCliConfigCategoryIfExists(
 }
 
 /**
- * Changes an error received from the CLI to a ConfigurationError with optionally an extra
- * error message appended, if it exists in a known set of configuration errors. Otherwise,
+ * Check if we are running on an unsupported platform/architecture combination.
+ */
+function isUnsupportedPlatform(): boolean {
+  return !SUPPORTED_PLATFORMS.some(
+    ([platform, arch]) =>
+      platform === process.platform && arch === process.arch,
+  );
+}
+
+/**
+ * Transform a CLI error into a ConfigurationError for an unsupported platform.
+ */
+function getUnsupportedPlatformError(cliError: CliError): ConfigurationError {
+  return new ConfigurationError(
+    "The CodeQL CLI does not support the platform/architecture combination of " +
+      `${process.platform}/${process.arch} ` +
+      `(see ${DocUrl.SYSTEM_REQUIREMENTS}). ` +
+      `The underlying error was: ${cliError.message}`,
+  );
+}
+
+/**
+ * Changes an error received from the CLI to a ConfigurationError with the message
+ * optionally being transformed, if it is a known configuration error. Otherwise,
  * simply returns the original error.
  */
-export function wrapCliConfigurationError(cliError: Error): Error {
-  if (!(cliError instanceof CommandInvocationError)) {
-    return cliError;
+export function wrapCliConfigurationError(cliError: CliError): Error {
+  if (isUnsupportedPlatform()) {
+    return getUnsupportedPlatformError(cliError);
   }
 
   const cliConfigErrorCategory = getCliConfigCategoryIfExists(cliError);

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Update the required checks based on the current branch.
-# Typically, this will be main.
+
+set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
@@ -27,10 +28,16 @@ fi
 
 echo "Getting checks for $GITHUB_SHA"
 
-# Ignore any checks with "https://", CodeQL, LGTM, and Update checks.
-CHECKS="$(gh api repos/github/codeql-action/commits/"${GITHUB_SHA}"/check-runs --paginate | jq --slurp --compact-output --raw-output '[.[].check_runs | .[].name | select(contains("https://") or . == "CodeQL" or . == "Dependabot" or . == "check-expected-release-files" or contains("Update") or contains("update") or contains("test-setup-python-scripts") | not)] | unique | sort')"
+# Ignore any checks with "https://", CodeQL, LGTM, Update, and ESLint checks.
+CHECKS="$(gh api repos/github/codeql-action/commits/"${GITHUB_SHA}"/check-runs --paginate | jq --slurp --compact-output --raw-output '[.[].check_runs.[] | select(.conclusion != "skipped") | .name | select(contains("https://") or . == "CodeQL" or . == "Dependabot" or . == "check-expected-release-files" or contains("Update") or contains("ESLint") or contains("update") or contains("test-setup-python-scripts") | not)] | unique | sort')"
 
 echo "$CHECKS" | jq
+
+# Fail if there are no checks
+if [ -z "$CHECKS" ] || [ "$(echo "$CHECKS" | jq '. | length')" -eq 0 ]; then
+  echo "No checks found for $GITHUB_SHA"
+  exit 1
+fi
 
 echo "{\"contexts\": ${CHECKS}}" > checks.json
 

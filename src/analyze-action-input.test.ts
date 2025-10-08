@@ -5,6 +5,7 @@ import * as actionsUtil from "./actions-util";
 import * as analyze from "./analyze";
 import * as api from "./api-client";
 import * as configUtils from "./config-utils";
+import * as gitUtils from "./git-utils";
 import * as statusReport from "./status-report";
 import {
   setupTests,
@@ -36,6 +37,7 @@ test("analyze action with RAM & threads from action inputs", async (t) => {
     };
     sinon.stub(configUtils, "getConfig").resolves({
       gitHubVersion,
+      augmentationProperties: {},
       languages: [],
       packs: [],
       trapCaches: {},
@@ -43,11 +45,11 @@ test("analyze action with RAM & threads from action inputs", async (t) => {
     const requiredInputStub = sinon.stub(actionsUtil, "getRequiredInput");
     requiredInputStub.withArgs("token").returns("fake-token");
     requiredInputStub.withArgs("upload-database").returns("false");
+    requiredInputStub.withArgs("output").returns("out");
     const optionalInputStub = sinon.stub(actionsUtil, "getOptionalInput");
-    optionalInputStub.withArgs("cleanup-level").returns("none");
     optionalInputStub.withArgs("expect-error").returns("false");
     sinon.stub(api, "getGitHubVersion").resolves(gitHubVersion);
-    sinon.stub(actionsUtil, "isAnalyzingDefaultBranch").resolves(true);
+    sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(true);
     setupActionsVars(tmpDir, tmpDir);
     mockFeatureFlagApiEndpoint(200, {});
 
@@ -60,6 +62,7 @@ test("analyze action with RAM & threads from action inputs", async (t) => {
 
     const runFinalizeStub = sinon.stub(analyze, "runFinalize");
     const runQueriesStub = sinon.stub(analyze, "runQueries");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const analyzeAction = require("./analyze-action");
 
     // When analyze-action.ts loads, it runs an async function from the top
@@ -68,8 +71,10 @@ test("analyze action with RAM & threads from action inputs", async (t) => {
     // wait for the action promise to complete before starting verification.
     await analyzeAction.runPromise;
 
+    t.assert(runFinalizeStub.calledOnce);
     t.deepEqual(runFinalizeStub.firstCall.args[1], "--threads=-1");
     t.deepEqual(runFinalizeStub.firstCall.args[2], "--ram=3012");
+    t.assert(runQueriesStub.calledOnce);
     t.deepEqual(runQueriesStub.firstCall.args[3], "--threads=-1");
     t.deepEqual(runQueriesStub.firstCall.args[1], "--ram=3012");
   });

@@ -24,6 +24,8 @@ import {
   checkActionVersion,
   checkDiskUsage,
   checkGitHubVersionInRange,
+  ConfigurationError,
+  getErrorMessage,
   initializeEnvironment,
   wrapError,
 } from "./util";
@@ -91,7 +93,7 @@ async function run() {
 
     config = await getConfig(getTemporaryDirectory(), logger);
     if (config === undefined) {
-      throw new Error(
+      throw new ConfigurationError(
         "Config file could not be found at expected location. Has the 'init' action been called?",
       );
     }
@@ -141,7 +143,7 @@ async function runWrapper() {
   try {
     await run();
   } catch (error) {
-    core.setFailed(`autobuild action failed. ${wrapError(error).message}`);
+    core.setFailed(`autobuild action failed. ${getErrorMessage(error)}`);
   }
 }
 
