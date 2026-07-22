@@ -44,10 +44,16 @@ jobs:
           GITHUB_CONTEXT: '${{ toJson(github) }}'
         run: echo "${GITHUB_CONTEXT}"
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0  # ensure we have all tags and can push commits
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'npm'
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
 
       - name: Update git config
         run: |
@@ -120,32 +126,22 @@ jobs:
       - name: Prepare partial Changelog
         env:
           PARTIAL_CHANGELOG: "${{ runner.temp }}/partial_changelog.md"
-          VERSION: "${{ steps.getVersion.outputs.version }}"
         run: |
-          python .github/workflows/script/prepare_changelog.py CHANGELOG.md "$VERSION" > $PARTIAL_CHANGELOG
+          python .github/workflows/script/prepare_changelog.py CHANGELOG.md > $PARTIAL_CHANGELOG
 
           echo "::group::Partial CHANGELOG"
           cat $PARTIAL_CHANGELOG
           echo "::endgroup::"
 
-      - name: Create mergeback branch and PR
-        if: ${{ steps.check.outputs.exists != 'true' && endsWith(github.ref_name, steps.getVersion.outputs.latest_release_branch) }}
-        uses: ./.github/actions/prepare-mergeback-branch
-        with:
-          base: "${{ env.BASE_BRANCH }}"
-          head: "${{ env.HEAD_BRANCH }}"
-          branch: "${{ steps.getVersion.outputs.newBranch }}"
-          version: "${{ steps.getVersion.outputs.version }}"
-          token: "${{ secrets.GITHUB_TOKEN }}"
-
       - name: Generate token
-        uses: actions/create-github-app-token@v2.1.4
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
           app-id: ${{ vars.AUTOMATION_APP_ID }}
           private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
 
       - name: Create the GitHub release
+        if: steps.check.outputs.exists != 'true'
         env:
           PARTIAL_CHANGELOG: "${{ runner.temp }}/partial_changelog.md"
           VERSION: "${{ steps.getVersion.outputs.version }}"
@@ -157,3 +153,13 @@ jobs:
             --latest=false \
             --title "$VERSION" \
             --notes-file "$PARTIAL_CHANGELOG"
+
+      - name: Create mergeback branch and PR
+        if: ${{ endsWith(github.ref_name, steps.getVersion.outputs.latest_release_branch) }}
+        uses: ./.github/actions/prepare-mergeback-branch
+        with:
+          base: "${{ env.BASE_BRANCH }}"
+          head: "${{ env.HEAD_BRANCH }}"
+          branch: "${{ steps.getVersion.outputs.newBranch }}"
+          version: "${{ steps.getVersion.outputs.version }}"
+          token: "${{ secrets.GITHUB_TOKEN }}"

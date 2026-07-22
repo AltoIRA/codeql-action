@@ -12,16 +12,19 @@ on:
     branches:
       - main
       - releases/v*
-  pull_request:
+  pull_request: {}
+  merge_group:
     types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
+      - checks_requested
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
     inputs:
+      dotnet-version:
+        type: string
+        description: The version of .NET to install
+        required: false
+        default: 9.x
       go-version:
         type: string
         description: The version of Go to install
@@ -29,6 +32,11 @@ on:
         default: '>=1.21.0'
   workflow_call:
     inputs:
+      dotnet-version:
+        type: string
+        description: The version of .NET to install
+        required: false
+        default: 9.x
       go-version:
         type: string
         description: The version of Go to install
@@ -38,8 +46,8 @@ defaults:
   run:
     shell: bash
 concurrency:
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || false }}
+  group: split-workflow-${{github.ref}}-${{inputs.dotnet-version}}-${{inputs.go-version}}
 jobs:
   split-workflow:
     strategy:
@@ -67,7 +75,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: ${{ inputs.dotnet-version || '9.x' }}
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ inputs.go-version || '>=1.21.0' }}
+          cache: false
       - name: Prepare test
         id: prepare-test
         uses: ./.github/actions/prepare-test
@@ -75,14 +92,9 @@ jobs:
           version: ${{ matrix.version }}
           use-all-platform-bundle: 'false'
           setup-kotlin: 'true'
-      - name: Install Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ inputs.go-version || '>=1.21.0' }}
-          cache: false
       - uses: ./../action/init
         with:
-          config-file: .github/codeql/codeql-config-packaging3.yml
+          config-file: '.github/codeql/codeql-config-packaging3.yml'
           packs: +codeql-testing/codeql-pack1@1.0.0
           languages: javascript
           tools: ${{ steps.prepare-test.outputs.tools-url }}
@@ -91,7 +103,7 @@ jobs:
       - uses: ./../action/analyze
         with:
           skip-queries: true
-          output: ${{ runner.temp }}/results
+          output: '${{ runner.temp }}/results'
           upload-database: false
 
       - name: Assert No Results
@@ -102,7 +114,7 @@ jobs:
           fi
       - uses: ./../action/analyze
         with:
-          output: ${{ runner.temp }}/results
+          output: '${{ runner.temp }}/results'
           upload-database: false
       - name: Assert Results
         run: |

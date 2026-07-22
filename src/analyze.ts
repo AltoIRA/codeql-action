@@ -3,31 +3,28 @@ import * as path from "path";
 import { performance } from "perf_hooks";
 
 import * as io from "@actions/io";
-import * as del from "del";
 import * as yaml from "js-yaml";
 
-import {
-  getRequiredInput,
-  getTemporaryDirectory,
-  PullRequestBranches,
-} from "./actions-util";
+import { getTemporaryDirectory, getRequiredInput } from "./actions-util";
 import * as analyses from "./analyses";
-import { getApiClient } from "./api-client";
 import { setupCppAutobuild } from "./autobuild";
 import { type CodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
-import { getJavaTempDependencyDir } from "./dependency-caching";
+import {
+  getCsharpTempDependencyDir,
+  getJavaTempDependencyDir,
+} from "./dependency-caching";
 import { addDiagnostic, makeDiagnostic } from "./diagnostics";
 import {
   DiffThunkRange,
-  writeDiffRangesJsonFile,
+  readDiffRangesJsonFile,
 } from "./diff-informed-analysis-utils";
 import { EnvVar } from "./environment";
 import { FeatureEnablement, Feature } from "./feature-flags";
-import { KnownLanguage, Language } from "./languages";
+import { BuiltInLanguage, Language } from "./languages";
 import { Logger, withGroupAsync } from "./logging";
-import { OverlayDatabaseMode } from "./overlay-database-utils";
-import { getRepositoryNwoFromEnv } from "./repository";
+import { OverlayDatabaseMode } from "./overlay/overlay-database-mode";
+import type * as sarif from "./sarif";
 import { DatabaseCreationTimings, EventReport } from "./status-report";
 import { endTracingForCluster } from "./tracer-config";
 import * as util from "./util";
@@ -44,89 +41,26 @@ export class CodeQLAnalysisError extends Error {
   }
 }
 
-export interface QueriesStatusReport {
-  /**
-   * Time taken in ms to run queries for actions (or undefined if this language was not analyzed).
-   *
-   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
-   * taken to run _all_ the queries.
-   */
-  analyze_builtin_queries_actions_duration_ms?: number;
-  /**
-   * Time taken in ms to run queries for cpp (or undefined if this language was not analyzed).
-   *
-   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
-   * taken to run _all_ the queries.
-   */
-  analyze_builtin_queries_cpp_duration_ms?: number;
-  /**
-   * Time taken in ms to run queries for csharp (or undefined if this language was not analyzed).
-   *
-   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
-   * taken to run _all_ the queries.
-   */
-  analyze_builtin_queries_csharp_duration_ms?: number;
-  /**
-   * Time taken in ms to run queries for go (or undefined if this language was not analyzed).
-   *
-   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
-   * taken to run _all_ the queries.
-   */
-  analyze_builtin_queries_go_duration_ms?: number;
-  /**
-   * Time taken in ms to run queries for java (or undefined if this language was not analyzed).
-   *
-   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
-   * taken to run _all_ the queries.
-   */
-  analyze_builtin_queries_java_duration_ms?: number;
-  /**
-   * Time taken in ms to run queries for javascript (or undefined if this language was not analyzed).
-   *
-   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
-   * taken to run _all_ the queries.
-   */
-  analyze_builtin_queries_javascript_duration_ms?: number;
-  /**
-   * Time taken in ms to run queries for python (or undefined if this language was not analyzed).
-   *
-   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
-   * taken to run _all_ the queries.
-   */
-  analyze_builtin_queries_python_duration_ms?: number;
-  /**
-   * Time taken in ms to run queries for ruby (or undefined if this language was not analyzed).
-   *
-   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
-   * taken to run _all_ the queries.
-   */
-  analyze_builtin_queries_ruby_duration_ms?: number;
-  /** Time taken in ms to run queries for swift (or undefined if this language was not analyzed).
-   *
-   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
-   * taken to run _all_ the queries.
-   */
-  analyze_builtin_queries_swift_duration_ms?: number;
+type BuiltInLanguageKey = keyof typeof BuiltInLanguage;
 
-  /** Time taken in ms to interpret results for actions (or undefined if this language was not analyzed). */
-  interpret_results_actions_duration_ms?: number;
-  /** Time taken in ms to interpret results for cpp (or undefined if this language was not analyzed). */
-  interpret_results_cpp_duration_ms?: number;
-  /** Time taken in ms to interpret results for csharp (or undefined if this language was not analyzed). */
-  interpret_results_csharp_duration_ms?: number;
-  /** Time taken in ms to interpret results for go (or undefined if this language was not analyzed). */
-  interpret_results_go_duration_ms?: number;
-  /** Time taken in ms to interpret results for java (or undefined if this language was not analyzed). */
-  interpret_results_java_duration_ms?: number;
-  /** Time taken in ms to interpret results for javascript (or undefined if this language was not analyzed). */
-  interpret_results_javascript_duration_ms?: number;
-  /** Time taken in ms to interpret results for python (or undefined if this language was not analyzed). */
-  interpret_results_python_duration_ms?: number;
-  /** Time taken in ms to interpret results for ruby (or undefined if this language was not analyzed). */
-  interpret_results_ruby_duration_ms?: number;
-  /** Time taken in ms to interpret results for swift (or undefined if this language was not analyzed). */
-  interpret_results_swift_duration_ms?: number;
+type RunQueriesDurationStatusReport = {
+  /**
+   * Time taken in ms to run queries for the language (or undefined if this language was not analyzed).
+   *
+   * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
+   * taken to run _all_ the queries.
+   */
+  [L in BuiltInLanguageKey as `analyze_builtin_queries_${L}_duration_ms`]?: number;
+};
 
+type InterpretResultsDurationStatusReport = {
+  /** Time taken in ms to interpret results for the language (or undefined if this language was not analyzed). */
+  [L in BuiltInLanguageKey as `interpret_results_${L}_duration_ms`]?: number;
+};
+
+export interface QueriesStatusReport
+  extends RunQueriesDurationStatusReport,
+    InterpretResultsDurationStatusReport {
   /**
    * Whether the analysis is diff-informed (in the sense that the action generates a diff-range data
    * extension for the analysis, regardless of whether the data extension is actually used by queries).
@@ -167,6 +101,7 @@ async function setupPythonExtractor(logger: Logger) {
 
 export async function runExtraction(
   codeql: CodeQL,
+  features: FeatureEnablement,
   config: configUtils.Config,
   logger: Logger,
 ) {
@@ -180,27 +115,36 @@ export async function runExtraction(
 
     if (await shouldExtractLanguage(codeql, config, language)) {
       logger.startGroup(`Extracting ${language}`);
-      if (language === KnownLanguage.python) {
+      if (language === BuiltInLanguage.python) {
         await setupPythonExtractor(logger);
       }
       if (config.buildMode) {
         if (
-          language === KnownLanguage.cpp &&
+          language === BuiltInLanguage.cpp &&
           config.buildMode === BuildMode.Autobuild
         ) {
           await setupCppAutobuild(codeql, logger);
         }
 
-        // The Java `build-mode: none` extractor places dependencies (.jar files) in the
+        // The Java and C# `build-mode: none` extractors place dependencies in the
         // database scratch directory by default. For dependency caching purposes, we want
         // a stable path that caches can be restored into and that we can cache at the
         // end of the workflow (i.e. that does not get removed when the scratch directory is).
         if (
-          language === KnownLanguage.java &&
+          language === BuiltInLanguage.java &&
           config.buildMode === BuildMode.None
         ) {
           process.env["CODEQL_EXTRACTOR_JAVA_OPTION_BUILDLESS_DEPENDENCY_DIR"] =
             getJavaTempDependencyDir();
+        }
+        if (
+          language === BuiltInLanguage.csharp &&
+          config.buildMode === BuildMode.None &&
+          (await features.getValue(Feature.CsharpCacheBuildModeNone))
+        ) {
+          process.env[
+            "CODEQL_EXTRACTOR_CSHARP_OPTION_BUILDLESS_DEPENDENCY_DIR"
+          ] = getCsharpTempDependencyDir();
         }
 
         await codeql.extractUsingBuildMode(config, language);
@@ -246,13 +190,14 @@ export function dbIsFinalized(
 
 async function finalizeDatabaseCreation(
   codeql: CodeQL,
+  features: FeatureEnablement,
   config: configUtils.Config,
   threadsFlag: string,
   memoryFlag: string,
   logger: Logger,
 ): Promise<DatabaseCreationTimings> {
   const extractionStart = performance.now();
-  await runExtraction(codeql, config, logger);
+  await runExtraction(codeql, features, config, logger);
   const extractionTime = performance.now() - extractionStart;
 
   const trapImportStart = performance.now();
@@ -287,209 +232,71 @@ async function finalizeDatabaseCreation(
  * the diff range information, or `undefined` if the feature is disabled.
  */
 export async function setupDiffInformedQueryRun(
-  branches: PullRequestBranches,
   logger: Logger,
 ): Promise<string | undefined> {
   return await withGroupAsync(
     "Generating diff range extension pack",
     async () => {
-      logger.info(
-        `Calculating diff ranges for ${branches.base}...${branches.head}`,
-      );
-      const diffRanges = await getPullRequestEditedDiffRanges(branches, logger);
-      const packDir = writeDiffRangeDataExtensionPack(logger, diffRanges);
-      if (packDir === undefined) {
-        logger.warning(
-          "Cannot create diff range extension pack for diff-informed queries; " +
-            "reverting to performing full analysis.",
-        );
-      } else {
+      const diffRanges = readDiffRangesJsonFile(logger);
+      if (diffRanges === undefined) {
         logger.info(
-          `Successfully created diff range extension pack at ${packDir}.`,
+          "No precomputed diff ranges found; skipping diff-informed analysis stage.",
         );
+        return undefined;
       }
+
+      const checkoutPath = getRequiredInput("checkout_path");
+      const packDir = writeDiffRangeDataExtensionPack(
+        logger,
+        diffRanges,
+        checkoutPath,
+      );
+      logger.info(
+        `Successfully created diff range extension pack at ${packDir}.`,
+      );
       return packDir;
     },
   );
 }
 
-/**
- * Return the file line ranges that were added or modified in the pull request.
- *
- * @param branches The base and head branches of the pull request.
- * @param logger
- * @returns An array of tuples, where each tuple contains the absolute path of a
- * file, the start line and the end line (both 1-based and inclusive) of an
- * added or modified range in that file. Returns `undefined` if the action was
- * not triggered by a pull request or if there was an error.
- */
-async function getPullRequestEditedDiffRanges(
-  branches: PullRequestBranches,
-  logger: Logger,
-): Promise<DiffThunkRange[] | undefined> {
-  const fileDiffs = await getFileDiffsWithBasehead(branches, logger);
-  if (fileDiffs === undefined) {
-    return undefined;
-  }
-  if (fileDiffs.length >= 300) {
-    // The "compare two commits" API returns a maximum of 300 changed files. If
-    // we see that many changed files, it is possible that there could be more,
-    // with the rest being truncated. In this case, we should not attempt to
-    // compute the diff ranges, as the result would be incomplete.
-    logger.warning(
-      `Cannot retrieve the full diff because there are too many ` +
-        `(${fileDiffs.length}) changed files in the pull request.`,
-    );
-    return undefined;
-  }
-  const results: DiffThunkRange[] = [];
-  for (const filediff of fileDiffs) {
-    const diffRanges = getDiffRanges(filediff, logger);
-    if (diffRanges === undefined) {
-      return undefined;
-    }
-    results.push(...diffRanges);
-  }
-  return results;
-}
+export function diffRangeExtensionPackContents(
+  ranges: DiffThunkRange[],
+  checkoutPath: string,
+): string {
+  const header = `
+extensions:
+  - addsTo:
+      pack: codeql/util
+      extensible: restrictAlertsTo
+      checkPresence: false
+    data:
+`;
 
-/**
- * This interface is an abbreviated version of the file diff object returned by
- * the GitHub API.
- */
-interface FileDiff {
-  filename: string;
-  changes: number;
-  // A patch may be absent if the file is binary, if the file diff is too large,
-  // or if the file is unchanged.
-  patch?: string | undefined;
-}
+  let data = ranges
+    .map((range) => {
+      // Diff-informed queries expect the file path to be absolute. CodeQL always
+      // uses forward slashes as the path separator, so on Windows we need to
+      // replace any backslashes with forward slashes.
+      const filename = path
+        .join(checkoutPath, range.path)
+        .replaceAll(path.sep, "/");
 
-async function getFileDiffsWithBasehead(
-  branches: PullRequestBranches,
-  logger: Logger,
-): Promise<FileDiff[] | undefined> {
-  // Check CODE_SCANNING_REPOSITORY first. If it is empty or not set, fall back
-  // to GITHUB_REPOSITORY.
-  const repositoryNwo = getRepositoryNwoFromEnv(
-    "CODE_SCANNING_REPOSITORY",
-    "GITHUB_REPOSITORY",
-  );
-  const basehead = `${branches.base}...${branches.head}`;
-  try {
-    const response = await getApiClient().rest.repos.compareCommitsWithBasehead(
-      {
-        owner: repositoryNwo.owner,
-        repo: repositoryNwo.repo,
-        basehead,
-        per_page: 1,
-      },
-    );
-    logger.debug(
-      `Response from compareCommitsWithBasehead(${basehead}):` +
-        `\n${JSON.stringify(response, null, 2)}`,
-    );
-    return response.data.files;
-  } catch (error: any) {
-    if (error.status) {
-      logger.warning(`Error retrieving diff ${basehead}: ${error.message}`);
-      logger.debug(
-        `Error running compareCommitsWithBasehead(${basehead}):` +
-          `\nRequest: ${JSON.stringify(error.request, null, 2)}` +
-          `\nError Response: ${JSON.stringify(error.response, null, 2)}`,
+      // Using yaml.dump() with `quoteStyle: "double"` ensures that all special
+      // characters are escaped, and that the path is always rendered as a
+      // quoted string on a single line.
+      return (
+        `      - [${yaml.dump(filename, { forceQuotes: true, quoteStyle: "single" }).trim()}, ` +
+        `${range.startLine}, ${range.endLine}]\n`
       );
-      return undefined;
-    } else {
-      throw error;
-    }
-  }
-}
-
-function getDiffRanges(
-  fileDiff: FileDiff,
-  logger: Logger,
-): DiffThunkRange[] | undefined {
-  // Diff-informed queries expect the file path to be absolute. CodeQL always
-  // uses forward slashes as the path separator, so on Windows we need to
-  // replace any backslashes with forward slashes.
-  const filename = path
-    .join(getRequiredInput("checkout_path"), fileDiff.filename)
-    .replaceAll(path.sep, "/");
-
-  if (fileDiff.patch === undefined) {
-    if (fileDiff.changes === 0) {
-      // There are situations where a changed file legitimately has no diff.
-      // For example, the file may be a binary file, or that the file may have
-      // been renamed with no changes to its contents. In these cases, the
-      // file would be reported as having 0 changes, and we can return an empty
-      // array to indicate no diff range in this file.
-      return [];
-    }
-    // If a file is reported to have nonzero changes but no patch, that may be
-    // due to the file diff being too large. In this case, we should fall back
-    // to a special diff range that covers the entire file.
-    return [
-      {
-        path: filename,
-        startLine: 0,
-        endLine: 0,
-      },
-    ];
+    })
+    .join("");
+  if (!data) {
+    // Ensure that the data extension is not empty, so that a pull request with
+    // no edited lines would exclude (instead of accepting) all alerts.
+    data = '      - ["", 0, 0]\n';
   }
 
-  // The 1-based file line number of the current line
-  let currentLine = 0;
-  // The 1-based file line number that starts the current range of added lines
-  let additionRangeStartLine: number | undefined = undefined;
-  const diffRanges: DiffThunkRange[] = [];
-
-  const diffLines = fileDiff.patch.split("\n");
-  // Adding a fake context line at the end ensures that the following loop will
-  // always terminate the last range of added lines.
-  diffLines.push(" ");
-
-  for (const diffLine of diffLines) {
-    if (diffLine.startsWith("-")) {
-      // Ignore deletions completely -- we do not even want to consider them when
-      // calculating consecutive ranges of added lines.
-      continue;
-    }
-    if (diffLine.startsWith("+")) {
-      if (additionRangeStartLine === undefined) {
-        additionRangeStartLine = currentLine;
-      }
-      currentLine++;
-      continue;
-    }
-    if (additionRangeStartLine !== undefined) {
-      // Any line that does not start with a "+" or "-" terminates the current
-      // range of added lines.
-      diffRanges.push({
-        path: filename,
-        startLine: additionRangeStartLine,
-        endLine: currentLine - 1,
-      });
-      additionRangeStartLine = undefined;
-    }
-    if (diffLine.startsWith("@@ ")) {
-      // A new hunk header line resets the current line number.
-      const match = diffLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-      if (match === null) {
-        logger.warning(
-          `Cannot parse diff hunk header for ${fileDiff.filename}: ${diffLine}`,
-        );
-        return undefined;
-      }
-      currentLine = parseInt(match[1], 10);
-      continue;
-    }
-    if (diffLine.startsWith(" ")) {
-      // An unchanged context line advances the current line number.
-      currentLine++;
-      continue;
-    }
-  }
-  return diffRanges;
+  return header + data;
 }
 
 /**
@@ -499,17 +306,14 @@ function getDiffRanges(
  * @param logger
  * @param ranges The file line ranges, as returned by
  * `getPullRequestEditedDiffRanges`.
- * @returns The absolute path of the directory containing the extension pack, or
- * `undefined` if no extension pack was created.
+ * @param checkoutPath The path at which the repository was checked out.
+ * @returns The absolute path of the directory containing the extension pack.
  */
 function writeDiffRangeDataExtensionPack(
   logger: Logger,
-  ranges: DiffThunkRange[] | undefined,
-): string | undefined {
-  if (ranges === undefined) {
-    return undefined;
-  }
-
+  ranges: DiffThunkRange[],
+  checkoutPath: string,
+): string {
   if (ranges.length === 0) {
     // An empty diff range means that there are no added or modified lines in
     // the pull request. But the `restrictAlertsTo` extensible predicate
@@ -540,41 +344,15 @@ dataExtensions:
 `,
   );
 
-  const header = `
-extensions:
-  - addsTo:
-      pack: codeql/util
-      extensible: restrictAlertsTo
-      checkPresence: false
-    data:
-`;
-
-  let data = ranges
-    .map(
-      (range) =>
-        // Using yaml.dump() with `forceQuotes: true` ensures that all special
-        // characters are escaped, and that the path is always rendered as a
-        // quoted string on a single line.
-        `      - [${yaml.dump(range.path, { forceQuotes: true }).trim()}, ` +
-        `${range.startLine}, ${range.endLine}]\n`,
-    )
-    .join("");
-  if (!data) {
-    // Ensure that the data extension is not empty, so that a pull request with
-    // no edited lines would exclude (instead of accepting) all alerts.
-    data = '      - ["", 0, 0]\n';
-  }
-
-  const extensionContents = header + data;
+  const extensionContents = diffRangeExtensionPackContents(
+    ranges,
+    checkoutPath,
+  );
   const extensionFilePath = path.join(diffRangeDir, "pr-diff-range.yml");
   fs.writeFileSync(extensionFilePath, extensionContents);
   logger.debug(
     `Wrote pr-diff-range extension pack to ${extensionFilePath}:\n${extensionContents}`,
   );
-
-  // Write the diff ranges to a JSON file, for action-side alert filtering by the
-  // upload-lib module.
-  writeDiffRangesJsonFile(logger, ranges);
 
   return diffRangeDir;
 }
@@ -621,7 +399,6 @@ export function addSarifExtension(
 export async function runQueries(
   sarifFolder: string,
   memoryFlag: string,
-  addSnippetsFlag: string,
   threadsFlag: string,
   diffRangePackDir: string | undefined,
   automationDetailsId: string | undefined,
@@ -730,9 +507,17 @@ export async function runQueries(
         endTimeInterpretResults.getTime() - startTimeInterpretResults.getTime();
       logger.endGroup();
 
-      logger.info(analysisSummary);
-      if (qualityAnalysisSummary) {
+      if (analysisSummary.trim()) {
+        logger.info(analysisSummary);
+      }
+      if (qualityAnalysisSummary?.trim()) {
         logger.info(qualityAnalysisSummary);
+      }
+      if (!config.enableFileCoverageInformation) {
+        logger.info(
+          "To speed up pull request analysis, file coverage information is only enabled when analyzing " +
+            "the default branch and protected branches.",
+        );
       }
 
       if (await features.getValue(Feature.QaTelemetryEnabled)) {
@@ -776,12 +561,9 @@ export async function runQueries(
   ): Promise<{ summary: string; sarifFile: string }> {
     logger.info(`Interpreting ${analysis.name} results for ${language}`);
 
-    // If this is a Code Quality analysis, correct the category to one
-    // accepted by the Code Quality backend.
-    let category = automationDetailsId;
-    if (analysis.kind === analyses.AnalysisKind.CodeQuality) {
-      category = analysis.fixCategory(logger, automationDetailsId);
-    }
+    // Apply the analysis configuration's `fixCategory` function to adjust the category if needed.
+    // This is a no-op for Code Scanning.
+    const category = analysis.fixCategory(logger, automationDetailsId);
 
     const sarifFile = path.join(
       sarifFolder,
@@ -811,7 +593,6 @@ export async function runQueries(
       databasePath,
       queries,
       sarifFile,
-      addSnippetsFlag,
       threadsFlag,
       enableDebugLogging ? "-vv" : "-v",
       sarifRunPropertyFlag,
@@ -825,7 +606,7 @@ export async function runQueries(
   function getPerQueryAlertCounts(sarifPath: string): Record<string, number> {
     const sarifObject = JSON.parse(
       fs.readFileSync(sarifPath, "utf8"),
-    ) as util.SarifFile;
+    ) as sarif.Log;
     // We do not need to compute fingerprints because we are not sending data based off of locations.
 
     // Generate the query: alert count object
@@ -847,6 +628,7 @@ export async function runQueries(
 }
 
 export async function runFinalize(
+  features: FeatureEnablement,
   outputDir: string,
   threadsFlag: string,
   memoryFlag: string,
@@ -855,7 +637,7 @@ export async function runFinalize(
   logger: Logger,
 ): Promise<DatabaseCreationTimings> {
   try {
-    await del.deleteAsync(outputDir, { force: true });
+    await fs.promises.rm(outputDir, { force: true, recursive: true });
   } catch (error: any) {
     if (error?.code !== "ENOENT") {
       throw error;
@@ -865,6 +647,7 @@ export async function runFinalize(
 
   const timings = await finalizeDatabaseCreation(
     codeql,
+    features,
     config,
     threadsFlag,
     memoryFlag,
@@ -903,7 +686,7 @@ export async function warnIfGoInstalledAfterInit(
 
       addDiagnostic(
         config,
-        KnownLanguage.go,
+        BuiltInLanguage.go,
         makeDiagnostic(
           "go/workflow/go-installed-after-codeql-init",
           "Go was installed after the `codeql-action/init` Action was run",
@@ -922,7 +705,3 @@ export async function warnIfGoInstalledAfterInit(
     }
   }
 }
-
-export const exportedForTesting = {
-  getDiffRanges,
-};

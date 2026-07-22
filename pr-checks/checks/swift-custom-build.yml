@@ -1,14 +1,16 @@
 name: "Swift analysis using a custom build command"
 description: "Tests creation of a Swift database using custom build"
-versions: ["linked", "default", "nightly-latest"]
-operatingSystems: ["macos"]
+versions:
+  - linked
+  - default
+  - nightly-latest
+operatingSystems:
+  - macos
 installGo: true
+installDotNet: true
 env:
   DOTNET_GENERATE_ASPNET_CERTIFICATE: "false"
 steps:
-  - name: Use Xcode 16
-    if: runner.os == 'macOS' && matrix.version != 'nightly-latest'
-    run: sudo xcode-select -s "/Applications/Xcode_16.app"
   - uses: ./../action/init
     id: init
     with:

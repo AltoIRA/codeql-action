@@ -1,6 +1,8 @@
 name: "Diagnostic export"
 description: "Tests that manually added diagnostics are correctly exported to SARIF."
-versions: ["linked", "nightly-latest"]
+versions:
+  - linked
+  - nightly-latest
 env:
   CODEQL_ACTION_EXPORT_DIAGNOSTICS: true
 steps:
@@ -25,13 +27,13 @@ steps:
       output: "${{ runner.temp }}/results"
       upload-database: false
   - name: Upload SARIF
-    uses: actions/upload-artifact@v4
+    uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
     with:
       name: diagnostics-export-${{ matrix.os }}-${{ matrix.version }}.sarif.json
       path: "${{ runner.temp }}/results/javascript.sarif"
       retention-days: 7
   - name: Check diagnostics appear in SARIF
-    uses: actions/github-script@v8
+    uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
     env:
       SARIF_PATH: "${{ runner.temp }}/results/javascript.sarif"
     with:

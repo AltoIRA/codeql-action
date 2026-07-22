@@ -12,18 +12,18 @@ import {
   isSelfHostedRunner,
 } from "./actions-util";
 import { getAnalysisKey, getApiClient } from "./api-client";
-import { parseRegistriesWithoutCredentials, type Config } from "./config-utils";
-import { DependencyCacheRestoreStatusReport } from "./dependency-caching";
+import type { Config } from "./config/action-config";
+import { parseRegistriesWithoutCredentials } from "./config/pack-registries";
+import type { DependencyCacheRestoreStatusReport } from "./dependency-caching";
 import { DocUrl } from "./doc-url";
 import { EnvVar } from "./environment";
 import { getRef } from "./git-utils";
-import { Logger } from "./logging";
-import { OverlayBaseDatabaseDownloadStats } from "./overlay-database-utils";
+import type { Logger } from "./logging";
+import type { OverlayBaseDatabaseDownloadStats } from "./overlay/caching";
 import { getRepositoryNwo } from "./repository";
-import { ToolsSource } from "./setup-codeql";
+import type { ToolsSource } from "./setup-codeql";
 import {
   ConfigurationError,
-  isHTTPError,
   getRequiredEnvParam,
   getCachedCodeQlVersion,
   isInTestMode,
@@ -33,6 +33,7 @@ import {
   BuildMode,
   getErrorMessage,
   getTestingEnvironment,
+  asHTTPError,
 } from "./util";
 
 export enum ActionName {
@@ -41,8 +42,20 @@ export enum ActionName {
   Init = "init",
   InitPost = "init-post",
   ResolveEnvironment = "resolve-environment",
+  SetupCodeQL = "setup-codeql",
   StartProxy = "start-proxy",
   UploadSarif = "upload-sarif",
+}
+
+/**
+ * Maps an `ActionName` to its display name. Usually that is the same, except
+ * for `ActionName.Analyze` where it is `"analyze"` instead of `"finish"`.
+ */
+export function getDisplayActionName(actionName: ActionName): string {
+  if (actionName === ActionName.Analyze) {
+    return "analyze";
+  }
+  return actionName;
 }
 
 /**
@@ -53,7 +66,7 @@ export enum ActionName {
  * considered to be a third party analysis and is treated differently when calculating SLOs. To ensure
  * misconfigured workflows are not treated as third party, only the upload-sarif action can return false.
  */
-export function isFirstPartyAnalysis(actionName: ActionName): boolean {
+function isFirstPartyAnalysis(actionName: ActionName): boolean {
   if (actionName !== ActionName.UploadSarif) {
     return true;
   }
@@ -251,7 +264,7 @@ export interface EventReport {
  *
  * @param actionName The name of the action, e.g. 'init', 'finish', 'upload-sarif'
  * @param status The status. Must be 'success', 'failure', or 'starting'
- * @param startedAt The time this action started executing.
+ * @param actionStartedAt The time this action started executing.
  * @param cause  Cause of failure (only supply if status is 'failure')
  * @param exception Exception (only supply if status is 'failure')
  * @returns undefined if an exception was thrown.
@@ -320,7 +333,9 @@ export async function createStatusReportBase(
     try {
       statusReport.actions_event_name = getWorkflowEventName();
     } catch (e) {
-      logger.warning(`Could not determine the workflow event name: ${e}.`);
+      logger.warning(
+        `Could not determine the workflow event name: ${getErrorMessage(e)}.`,
+      );
     }
 
     if (config) {
@@ -353,7 +368,6 @@ export async function createStatusReportBase(
       statusReport.matrix_vars = matrix;
     }
     if ("RUNNER_ARCH" in process.env) {
-      // RUNNER_ARCH is available only in GHES 3.4 and later
       // Values other than X86, X64, ARM, or ARM64 are discarded server side
       statusReport.runner_arch = process.env["RUNNER_ARCH"];
     }
@@ -373,7 +387,7 @@ export async function createStatusReportBase(
     return statusReport;
   } catch (e) {
     logger.warning(
-      `Caught an exception while gathering information for telemetry: ${e}. Will skip sending status report.`,
+      `Failed to gather information for telemetry: ${getErrorMessage(e)}. Will skip sending status report.`,
     );
 
     // Re-throw the exception in test mode. While testing, we want to know if something goes wrong here.
@@ -386,9 +400,9 @@ export async function createStatusReportBase(
 }
 
 const OUT_OF_DATE_MSG =
-  "CodeQL Action is out-of-date. Please upgrade to the latest version of codeql-action.";
+  "CodeQL Action is out-of-date. Please upgrade to the latest version of `codeql-action`.";
 const INCOMPATIBLE_MSG =
-  "CodeQL Action version is incompatible with the code scanning endpoint. Please update to a compatible version of codeql-action.";
+  "CodeQL Action version is incompatible with the API endpoint. Please update to a compatible version of `codeql-action`.";
 
 /**
  * Send a status report to the code_scanning/analysis/status endpoint.
@@ -428,8 +442,9 @@ export async function sendStatusReport<S extends StatusReportBase>(
       },
     );
   } catch (e) {
-    if (isHTTPError(e)) {
-      switch (e.status) {
+    const httpError = asHTTPError(e);
+    if (httpError !== undefined) {
+      switch (httpError.status) {
         case 403:
           if (
             getWorkflowEventName() === "push" &&
@@ -437,16 +452,20 @@ export async function sendStatusReport<S extends StatusReportBase>(
           ) {
             core.warning(
               'Workflows triggered by Dependabot on the "push" event run with read-only access. ' +
-                "Uploading Code Scanning results requires write access. " +
-                'To use Code Scanning with Dependabot, please ensure you are using the "pull_request" event for this workflow and avoid triggering on the "push" event for Dependabot branches. ' +
+                "Uploading CodeQL results requires write access. " +
+                'To use CodeQL with Dependabot, please ensure you are using the "pull_request" event for this workflow and avoid triggering on the "push" event for Dependabot branches. ' +
                 `See ${DocUrl.SCANNING_ON_PUSH} for more information on how to configure these events.`,
             );
           } else {
-            core.warning(e.message);
+            core.warning(
+              "This run of the CodeQL Action does not have permission to access the CodeQL Action API endpoints. " +
+                "This could be because the Action is running on a pull request from a fork. If not, " +
+                `please ensure the workflow has at least the 'security-events: read' permission. Details: ${httpError.message}`,
+            );
           }
           return;
         case 404:
-          core.warning(e.message);
+          core.warning(httpError.message);
           return;
         case 422:
           // schema incompatibility when reporting status
@@ -464,7 +483,7 @@ export async function sendStatusReport<S extends StatusReportBase>(
     // something else has gone wrong and the request/response will be logged by octokit
     // it's possible this is a transient error and we should continue scanning
     core.warning(
-      `An unexpected error occurred when sending code scanning status report: ${getErrorMessage(
+      `An unexpected error occurred when sending a status report: ${getErrorMessage(
         e,
       )}`,
     );
@@ -514,6 +533,16 @@ export interface InitWithConfigStatusReport extends InitStatusReport {
   query_filters: string;
   /** Path to the specified code scanning config file, from the 'config-file' config field. */
   config_file: string;
+}
+
+/** Fields of the init status report populated when the tools source is `download`. */
+export interface InitToolsDownloadFields {
+  /** Time taken to download the bundle, in milliseconds. */
+  tools_download_duration_ms?: number;
+  /**
+   * Whether the relevant tools dotcom feature flags have been misconfigured.
+   * Only populated if we attempt to determine the default version based on the dotcom feature flags. */
+  tools_feature_flags_valid?: boolean;
 }
 
 /**
@@ -589,4 +618,36 @@ export async function createInitWithConfigStatusReport(
       parseRegistriesWithoutCredentials(getOptionalInput("registries")) ?? [],
     ),
   };
+}
+
+export async function sendUnhandledErrorStatusReport(
+  actionName: ActionName,
+  actionStartedAt: Date,
+  error: unknown,
+  logger: Logger,
+): Promise<void> {
+  try {
+    // In the future, we may want to add a specific field for unhandled errors so we can
+    // create a dedicated monitor for them.
+    const statusReport = await createStatusReportBase(
+      actionName,
+      "failure",
+      actionStartedAt,
+      undefined,
+      undefined,
+      logger,
+      `Unhandled CodeQL Action error: ${getErrorMessage(error)}`,
+      error instanceof Error ? error.stack : undefined,
+    );
+    if (statusReport !== undefined) {
+      await sendStatusReport(statusReport);
+    }
+  } catch (e) {
+    logger.warning(
+      `Failed to send the unhandled error status report: ${getErrorMessage(e)}.`,
+    );
+    if (isInTestMode()) {
+      throw e;
+    }
+  }
 }

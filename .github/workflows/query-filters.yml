@@ -6,14 +6,15 @@ on:
     - main
     - releases/v*
   pull_request:
-    types:
-    - opened
-    - synchronize
-    - reopened
-    - ready_for_review
+  merge_group:
+    types: [checks_requested]
   schedule:
     - cron: '0 5 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+
+concurrency:
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || false }}
+  group: ${{ github.workflow }}-${{ github.ref }}
 
 defaults:
   run:
@@ -29,10 +30,10 @@ jobs:
       contents: read # This permission is needed to allow the GitHub Actions workflow to read the contents of the repository.
     steps:
     - name: Check out repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
     - name: Install Node.js
-      uses: actions/setup-node@v5
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: 24
         cache: npm

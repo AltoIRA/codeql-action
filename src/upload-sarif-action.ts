@@ -1,12 +1,14 @@
 import * as core from "@actions/core";
 
+import { Action, ActionState, runInActions } from "./action-common";
 import * as actionsUtil from "./actions-util";
 import { getActionVersion, getTemporaryDirectory } from "./actions-util";
 import * as analyses from "./analyses";
 import { getGitHubVersion } from "./api-client";
-import { Features } from "./feature-flags";
-import { Logger, getActionsLogger } from "./logging";
+import { initFeatures } from "./feature-flags";
+import { Logger } from "./logging";
 import { getRepositoryNwo } from "./repository";
+import { InvalidSarifUploadError } from "./sarif";
 import {
   createStatusReportBase,
   sendStatusReport,
@@ -16,12 +18,11 @@ import {
   isThirdPartyAnalysis,
 } from "./status-report";
 import * as upload_lib from "./upload-lib";
-import { uploadSarif } from "./upload-sarif";
+import { postProcessAndUploadSarif } from "./upload-sarif";
 import {
   ConfigurationError,
   checkActionVersion,
   checkDiskUsage,
-  getErrorMessage,
   initializeEnvironment,
   shouldSkipSarifUpload,
   wrapError,
@@ -53,46 +54,47 @@ async function sendSuccessStatusReport(
   }
 }
 
-async function run() {
-  const startedAt = new Date();
-  const logger = getActionsLogger();
-  initializeEnvironment(getActionVersion());
-
-  const gitHubVersion = await getGitHubVersion();
-  checkActionVersion(getActionVersion(), gitHubVersion);
-
-  // Make inputs accessible in the `post` step.
-  actionsUtil.persistInputs();
-
-  const repositoryNwo = getRepositoryNwo();
-  const features = new Features(
-    gitHubVersion,
-    repositoryNwo,
-    getTemporaryDirectory(),
-    logger,
-  );
-
-  const startingStatusReportBase = await createStatusReportBase(
-    ActionName.UploadSarif,
-    "starting",
-    startedAt,
-    undefined,
-    await checkDiskUsage(logger),
-    logger,
-  );
-  if (startingStatusReportBase !== undefined) {
-    await sendStatusReport(startingStatusReportBase);
-  }
-
+async function run({ startedAt, logger }: ActionState<["Base", "Logger"]>) {
+  // To capture errors appropriately, keep as much code within the try-catch as
+  // possible, and only use safe functions outside.
   try {
+    initializeEnvironment(getActionVersion());
+
+    const gitHubVersion = await getGitHubVersion();
+    checkActionVersion(getActionVersion(), gitHubVersion);
+
+    // Make inputs accessible in the `post` step.
+    actionsUtil.persistInputs();
+
+    const repositoryNwo = getRepositoryNwo();
+    const features = initFeatures(
+      gitHubVersion,
+      repositoryNwo,
+      getTemporaryDirectory(),
+      logger,
+    );
+
+    const startingStatusReportBase = await createStatusReportBase(
+      ActionName.UploadSarif,
+      "starting",
+      startedAt,
+      undefined,
+      await checkDiskUsage(logger),
+      logger,
+    );
+    if (startingStatusReportBase !== undefined) {
+      await sendStatusReport(startingStatusReportBase);
+    }
+
     // `sarifPath` can either be a path to a single file, or a path to a directory.
     const sarifPath = actionsUtil.getRequiredInput("sarif_file");
     const checkoutPath = actionsUtil.getRequiredInput("checkout_path");
     const category = actionsUtil.getOptionalInput("category");
 
-    const uploadResults = await uploadSarif(
+    const uploadResults = await postProcessAndUploadSarif(
       logger,
       features,
+      "always",
       checkoutPath,
       sarifPath,
       category,
@@ -136,7 +138,7 @@ async function run() {
   } catch (unwrappedError) {
     const error =
       isThirdPartyAnalysis(ActionName.UploadSarif) &&
-      unwrappedError instanceof upload_lib.InvalidSarifUploadError
+      unwrappedError instanceof InvalidSarifUploadError
         ? new ConfigurationError(unwrappedError.message)
         : wrapError(unwrappedError);
     const message = error.message;
@@ -159,14 +161,12 @@ async function run() {
   }
 }
 
-async function runWrapper() {
-  try {
-    await run();
-  } catch (error) {
-    core.setFailed(
-      `codeql/upload-sarif action failed: ${getErrorMessage(error)}`,
-    );
-  }
-}
+/** Defines the `upload-sarif` Action. */
+const uploadSarif: Action = {
+  name: ActionName.UploadSarif,
+  run,
+};
 
-void runWrapper();
+export async function runWrapper() {
+  await runInActions(uploadSarif);
+}

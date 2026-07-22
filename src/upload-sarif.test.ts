@@ -6,10 +6,10 @@ import * as sinon from "sinon";
 
 import { AnalysisKind, getAnalysisConfig } from "./analyses";
 import { getRunnerLogger } from "./logging";
-import { createFeatures, setupTests } from "./testing-utils";
+import { createFeatures, makeMacro, setupTests } from "./testing-utils";
 import { UploadResult } from "./upload-lib";
 import * as uploadLib from "./upload-lib";
-import { uploadSarif } from "./upload-sarif";
+import { postProcessAndUploadSarif } from "./upload-sarif";
 import * as util from "./util";
 
 setupTests(test);
@@ -19,7 +19,31 @@ interface UploadSarifExpectedResult {
   expectedFiles?: string[];
 }
 
-const uploadSarifMacro = test.macro({
+function mockPostProcessSarifFiles() {
+  const postProcessSarifFiles = sinon.stub(uploadLib, "postProcessSarifFiles");
+
+  for (const analysisKind of Object.values(AnalysisKind)) {
+    const analysisConfig = getAnalysisConfig(analysisKind);
+    postProcessSarifFiles
+      .withArgs(
+        sinon.match.any,
+        sinon.match.any,
+        sinon.match.any,
+        sinon.match.any,
+        sinon.match.any,
+        analysisConfig,
+      )
+      .resolves({
+        sarif: { version: "2.1.0", runs: [] },
+        analysisKey: "",
+        environment: "",
+      });
+  }
+
+  return postProcessSarifFiles;
+}
+
+const postProcessAndUploadSarifMacro = makeMacro({
   exec: async (
     t: ExecutionContext<unknown>,
     sarifFiles: string[],
@@ -33,22 +57,17 @@ const uploadSarifMacro = test.macro({
 
       const toFullPath = (filename: string) => path.join(tempDir, filename);
 
-      const uploadSpecifiedFiles = sinon.stub(
+      const postProcessSarifFiles = mockPostProcessSarifFiles();
+      const uploadPostProcessedFiles = sinon.stub(
         uploadLib,
-        "uploadSpecifiedFiles",
+        "uploadPostProcessedFiles",
       );
 
       for (const analysisKind of Object.values(AnalysisKind)) {
-        uploadSpecifiedFiles
-          .withArgs(
-            sinon.match.any,
-            sinon.match.any,
-            sinon.match.any,
-            features,
-            logger,
-            getAnalysisConfig(analysisKind),
-          )
-          .resolves(expectedResult[analysisKind as AnalysisKind]?.uploadResult);
+        const analysisConfig = getAnalysisConfig(analysisKind);
+        uploadPostProcessedFiles
+          .withArgs(logger, sinon.match.any, analysisConfig, sinon.match.any)
+          .resolves(expectedResult[analysisKind]?.uploadResult);
       }
 
       const fullSarifPaths = sarifFiles.map(toFullPath);
@@ -56,53 +75,56 @@ const uploadSarifMacro = test.macro({
         fs.writeFileSync(sarifFile, "");
       }
 
-      const actual = await uploadSarif(logger, features, "", testPath);
+      const actual = await postProcessAndUploadSarif(
+        logger,
+        features,
+        "always",
+        "",
+        testPath,
+      );
 
       for (const analysisKind of Object.values(AnalysisKind)) {
         const analysisKindResult = expectedResult[analysisKind];
         if (analysisKindResult) {
           // We are expecting a result for this analysis kind, check that we have it.
           t.deepEqual(actual[analysisKind], analysisKindResult.uploadResult);
-          // Additionally, check that the mocked `uploadSpecifiedFiles` was called with only the file paths
+          // Additionally, check that the mocked `postProcessSarifFiles` was called with only the file paths
           // that we expected it to be called with.
           t.assert(
-            uploadSpecifiedFiles.calledWith(
+            postProcessSarifFiles.calledWith(
+              logger,
+              features,
+              sinon.match.any,
               analysisKindResult.expectedFiles?.map(toFullPath) ??
                 fullSarifPaths,
               sinon.match.any,
-              sinon.match.any,
-              features,
-              logger,
               getAnalysisConfig(analysisKind),
             ),
           );
         } else {
           // Otherwise, we are not expecting a result for this analysis kind. However, note that `undefined`
-          // is also returned by our mocked `uploadSpecifiedFiles` when there is no expected result for this
+          // is also returned by our mocked `uploadProcessedFiles` when there is no expected result for this
           // analysis kind.
           t.is(actual[analysisKind], undefined);
-          // Therefore, we also check that the mocked `uploadSpecifiedFiles` was not called for this analysis kind.
+          // Therefore, we also check that the mocked `uploadProcessedFiles` was not called for this analysis kind.
           t.assert(
-            !uploadSpecifiedFiles.calledWith(
-              sinon.match.any,
-              sinon.match.any,
-              sinon.match.any,
-              features,
+            !uploadPostProcessedFiles.calledWith(
               logger,
+              sinon.match.any,
               getAnalysisConfig(analysisKind),
+              sinon.match.any,
             ),
-            `uploadSpecifiedFiles was called for ${analysisKind}, but should not have been.`,
+            `uploadProcessedFiles was called for ${analysisKind}, but should not have been.`,
           );
         }
       }
     });
   },
-  title: (providedTitle = "") => `uploadSarif - ${providedTitle}`,
+  title: (providedTitle = "") => `processAndUploadSarif - ${providedTitle}`,
 });
 
-test(
+postProcessAndUploadSarifMacro.serial(
   "SARIF file",
-  uploadSarifMacro,
   ["test.sarif"],
   (tempDir) => path.join(tempDir, "test.sarif"),
   {
@@ -115,9 +137,8 @@ test(
   },
 );
 
-test(
+postProcessAndUploadSarifMacro.serial(
   "JSON file",
-  uploadSarifMacro,
   ["test.json"],
   (tempDir) => path.join(tempDir, "test.json"),
   {
@@ -130,9 +151,8 @@ test(
   },
 );
 
-test(
+postProcessAndUploadSarifMacro.serial(
   "Code Scanning files",
-  uploadSarifMacro,
   ["test.json", "test.sarif"],
   undefined,
   {
@@ -146,9 +166,8 @@ test(
   },
 );
 
-test(
+postProcessAndUploadSarifMacro.serial(
   "Code Quality file",
-  uploadSarifMacro,
   ["test.quality.sarif"],
   (tempDir) => path.join(tempDir, "test.quality.sarif"),
   {
@@ -161,9 +180,8 @@ test(
   },
 );
 
-test(
+postProcessAndUploadSarifMacro.serial(
   "Mixed files",
-  uploadSarifMacro,
   ["test.sarif", "test.quality.sarif"],
   undefined,
   {
@@ -181,5 +199,73 @@ test(
       },
       expectedFiles: ["test.quality.sarif"],
     },
+  },
+);
+
+test.serial(
+  "postProcessAndUploadSarif doesn't upload if upload is disabled",
+  async (t) => {
+    await util.withTmpDir(async (tempDir) => {
+      const logger = getRunnerLogger(true);
+      const features = createFeatures([]);
+
+      const toFullPath = (filename: string) => path.join(tempDir, filename);
+
+      const postProcessSarifFiles = mockPostProcessSarifFiles();
+      const uploadPostProcessedFiles = sinon.stub(
+        uploadLib,
+        "uploadPostProcessedFiles",
+      );
+
+      fs.writeFileSync(toFullPath("test.sarif"), "");
+      fs.writeFileSync(toFullPath("test.quality.sarif"), "");
+
+      const actual = await postProcessAndUploadSarif(
+        logger,
+        features,
+        "never",
+        "",
+        tempDir,
+      );
+
+      t.truthy(actual);
+      t.assert(postProcessSarifFiles.calledTwice);
+      t.assert(uploadPostProcessedFiles.notCalled);
+    });
+  },
+);
+
+test.serial(
+  "postProcessAndUploadSarif writes post-processed SARIF files if output directory is provided",
+  async (t) => {
+    await util.withTmpDir(async (tempDir) => {
+      const logger = getRunnerLogger(true);
+      const features = createFeatures([]);
+
+      const toFullPath = (filename: string) => path.join(tempDir, filename);
+
+      const postProcessSarifFiles = mockPostProcessSarifFiles();
+
+      fs.writeFileSync(toFullPath("test.sarif"), "");
+      fs.writeFileSync(toFullPath("test.quality.sarif"), "");
+
+      const postProcessedOutPath = path.join(tempDir, "post-processed");
+      const actual = await postProcessAndUploadSarif(
+        logger,
+        features,
+        "never",
+        "",
+        tempDir,
+        "",
+        postProcessedOutPath,
+      );
+
+      t.truthy(actual);
+      t.assert(postProcessSarifFiles.calledTwice);
+      t.assert(fs.existsSync(path.join(postProcessedOutPath, "upload.sarif")));
+      t.assert(
+        fs.existsSync(path.join(postProcessedOutPath, "upload.quality.sarif")),
+      );
+    });
   },
 );

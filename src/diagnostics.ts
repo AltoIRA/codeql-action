@@ -6,24 +6,45 @@ import { Language } from "./languages";
 import { getActionsLogger } from "./logging";
 import { getCodeQLDatabasePath } from "./util";
 
-/** Represents a diagnostic message for the tool status page, etc. */
-export interface DiagnosticMessage {
+/**
+ * Known tags for diagnostics. There is currently only "internal-error",
+ * but others may be added in the future.
+ */
+export type DiagnosticTag = "internal-error";
+
+/** Optional information about the origin of a diagnostic. */
+export type DiagnosticSourceOptions = {
+  /**
+   * Name of the CodeQL extractor. This is used to identify which tool component the reporting
+   * descriptor object should be nested under in SARIF.
+   */
+  extractorName?: string;
+  /** An array of tags for the diagnostic. */
+  tags?: DiagnosticTag[];
+};
+
+/** Represents information about the origin of a diagnostic. */
+export type DiagnosticSource = {
+  /**
+   * An identifier under which it makes sense to group this diagnostic message.
+   * This is used to build the SARIF reporting descriptor object.
+   */
+  id: string;
+  /** Display name for the ID. This is used to build the SARIF reporting descriptor object. */
+  name: string;
+} & DiagnosticSourceOptions;
+
+/**
+ * Represents a diagnostic message for the tool status page, etc.
+ *
+ * Unlike {@link DiagnosticMessage}, properties which can automatically
+ * be populated are optional in this type.
+ */
+export type DiagnosticMessageOptions = {
   /** ISO 8601 timestamp */
-  timestamp: string;
-  source: {
-    /**
-     * An identifier under which it makes sense to group this diagnostic message.
-     * This is used to build the SARIF reporting descriptor object.
-     */
-    id: string;
-    /** Display name for the ID. This is used to build the SARIF reporting descriptor object. */
-    name: string;
-    /**
-     * Name of the CodeQL extractor. This is used to identify which tool component the reporting
-     * descriptor object should be nested under in SARIF.
-     */
-    extractorName?: string;
-  };
+  timestamp?: string;
+  /** Information about the origin of the diagnostic. */
+  source?: DiagnosticSourceOptions;
   /** GitHub flavored Markdown formatted message. Should include inline links to any help pages. */
   markdownMessage?: string;
   /** Plain text message. Used by components where the string processing needed to support Markdown is cumbersome. */
@@ -53,7 +74,15 @@ export interface DiagnosticMessage {
   };
   /** Structured metadata about the diagnostic message */
   attributes?: { [key: string]: any };
-}
+};
+
+/** Represents a diagnostic message for the tool status page, etc. */
+export type DiagnosticMessage = DiagnosticMessageOptions & {
+  /** ISO 8601 timestamp */
+  timestamp: string;
+  /** Information about the origin of the diagnostic. */
+  source: DiagnosticSource;
+};
 
 /** Represents a diagnostic message that has not yet been written to the database. */
 interface UnwrittenDiagnostic {
@@ -67,6 +96,19 @@ interface UnwrittenDiagnostic {
 let unwrittenDiagnostics: UnwrittenDiagnostic[] = [];
 
 /**
+ * A list of diagnostics which have not yet been written to disk,
+ * and where the language does not matter.
+ */
+let unwrittenDefaultLanguageDiagnostics: DiagnosticMessage[] = [];
+
+/**
+ * Counter used to generate a unique suffix for each diagnostic filename, so that
+ * two diagnostics produced within the same millisecond do not overwrite each
+ * other on disk.
+ */
+let diagnosticCounter = 0;
+
+/**
  * Constructs a new diagnostic message with the specified id and name, as well as optional additional data.
  *
  * @param id An identifier under which it makes sense to group this diagnostic message.
@@ -77,7 +119,7 @@ let unwrittenDiagnostics: UnwrittenDiagnostic[] = [];
 export function makeDiagnostic(
   id: string,
   name: string,
-  data: Partial<DiagnosticMessage> | undefined = undefined,
+  data: DiagnosticMessageOptions | undefined = undefined,
 ): DiagnosticMessage {
   return {
     ...data,
@@ -117,6 +159,24 @@ export function addDiagnostic(
   }
 }
 
+/** Adds a diagnostic that is not specific to any language. */
+export function addNoLanguageDiagnostic(
+  config: Config | undefined,
+  diagnostic: DiagnosticMessage,
+) {
+  if (config !== undefined) {
+    addDiagnostic(
+      config,
+      // Arbitrarily choose the first language. We could also choose all languages, but that
+      // increases the risk of misinterpreting the data.
+      config.languages[0],
+      diagnostic,
+    );
+  } else {
+    unwrittenDefaultLanguageDiagnostics.push(diagnostic);
+  }
+}
+
 /**
  * Writes the given diagnostic to the database.
  *
@@ -143,10 +203,18 @@ function writeDiagnostic(
     // Create the directory if it doesn't exist yet.
     mkdirSync(diagnosticsPath, { recursive: true });
 
+    // Include a monotonically increasing suffix to avoid filename collisions
+    // between diagnostics produced within the same millisecond.
+    const uniqueSuffix = (diagnosticCounter++).toString();
+    // We should only need to remove colons, but to be defensive, only allow a restricted set of
+    // characters.
+    const sanitizedTimestamp = diagnostic.timestamp.replace(
+      /[^a-zA-Z0-9.-]/g,
+      "",
+    );
     const jsonPath = path.resolve(
       diagnosticsPath,
-      // Remove colons from the timestamp as these are not allowed in Windows filenames.
-      `codeql-action-${diagnostic.timestamp.replaceAll(":", "")}.json`,
+      `codeql-action-${sanitizedTimestamp}-${uniqueSuffix}.json`,
     );
 
     writeFileSync(jsonPath, JSON.stringify(diagnostic));
@@ -174,14 +242,47 @@ export function logUnwrittenDiagnostics() {
 /** Writes all unwritten diagnostics to disk. */
 export function flushDiagnostics(config: Config) {
   const logger = getActionsLogger();
-  logger.debug(
-    `Writing ${unwrittenDiagnostics.length} diagnostic(s) to database.`,
-  );
+
+  const diagnosticsCount =
+    unwrittenDiagnostics.length + unwrittenDefaultLanguageDiagnostics.length;
+  logger.debug(`Writing ${diagnosticsCount} diagnostic(s) to database.`);
 
   for (const unwritten of unwrittenDiagnostics) {
     writeDiagnostic(config, unwritten.language, unwritten.diagnostic);
   }
+  for (const unwritten of unwrittenDefaultLanguageDiagnostics) {
+    addNoLanguageDiagnostic(config, unwritten);
+  }
 
-  // Reset the unwritten diagnostics array.
+  // Reset the unwritten diagnostics arrays.
   unwrittenDiagnostics = [];
+  unwrittenDefaultLanguageDiagnostics = [];
+}
+
+/**
+ * Creates a telemetry-only diagnostic message. This is a convenience function
+ * for creating diagnostics that should only be sent to telemetry and not
+ * displayed on the status page or CLI summary table.
+ *
+ * @param id An identifier under which it makes sense to group this diagnostic message
+ * @param name Display name
+ * @param attributes Structured metadata
+ */
+export function makeTelemetryDiagnostic(
+  id: string,
+  name: string,
+  attributes: { [key: string]: any },
+  tags?: DiagnosticTag[],
+): DiagnosticMessage {
+  return makeDiagnostic(id, name, {
+    attributes,
+    visibility: {
+      cliSummaryTable: false,
+      statusPage: false,
+      telemetry: true,
+    },
+    source: {
+      tags,
+    },
+  });
 }

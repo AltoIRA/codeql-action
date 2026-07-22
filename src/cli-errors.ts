@@ -144,6 +144,7 @@ export enum CliConfigErrorCategory {
   OutOfMemoryOrDisk = "OutOfMemoryOrDisk",
   PackCannotBeFound = "PackCannotBeFound",
   PackMissingAuth = "PackMissingAuth",
+  SwiftIncompatibleOs = "SwiftIncompatibleOs",
   SwiftBuildFailed = "SwiftBuildFailed",
   UnsupportedBuildMode = "UnsupportedBuildMode",
 }
@@ -159,10 +160,7 @@ type CliErrorConfiguration = {
  * All of our caught CLI error messages that we handle specially: ie. if we
  * would like to categorize an error as a configuration error or not.
  */
-export const cliErrorsConfig: Record<
-  CliConfigErrorCategory,
-  CliErrorConfiguration
-> = {
+const cliErrorsConfig: Record<CliConfigErrorCategory, CliErrorConfiguration> = {
   [CliConfigErrorCategory.AutobuildError]: {
     cliErrorMessageCandidates: [
       new RegExp("We were unable to automatically build your code"),
@@ -264,6 +262,9 @@ export const cliErrorsConfig: Record<
       new RegExp(
         "Query pack .* cannot be found\\. Check the spelling of the pack\\.",
       ),
+      new RegExp(
+        "is not a .ql file, .qls file, a directory, or a query pack specification.",
+      ),
     ],
   },
   [CliConfigErrorCategory.PackMissingAuth]: {
@@ -279,6 +280,12 @@ export const cliErrorsConfig: Record<
       new RegExp(
         "\\[autobuilder/build\\] \\[build-command-failed\\] `autobuild` failed to run the build command",
       ),
+    ],
+  },
+  [CliConfigErrorCategory.SwiftIncompatibleOs]: {
+    cliErrorMessageCandidates: [
+      new RegExp("\\[incompatible-os\\]"),
+      new RegExp("Swift analysis is only supported on macOS"),
     ],
   },
   [CliConfigErrorCategory.UnsupportedBuildMode]: {

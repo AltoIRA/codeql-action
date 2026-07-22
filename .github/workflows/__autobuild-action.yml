@@ -12,24 +12,32 @@ on:
     branches:
       - main
       - releases/v*
-  pull_request:
+  pull_request: {}
+  merge_group:
     types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
+      - checks_requested
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
-    inputs: {}
+    inputs:
+      dotnet-version:
+        type: string
+        description: The version of .NET to install
+        required: false
+        default: 9.x
   workflow_call:
-    inputs: {}
+    inputs:
+      dotnet-version:
+        type: string
+        description: The version of .NET to install
+        required: false
+        default: 9.x
 defaults:
   run:
     shell: bash
 concurrency:
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || false }}
+  group: autobuild-action-${{github.ref}}-${{inputs.dotnet-version}}
 jobs:
   autobuild-action:
     strategy:
@@ -51,7 +59,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: ${{ inputs.dotnet-version || '9.x' }}
       - name: Prepare test
         id: prepare-test
         uses: ./.github/actions/prepare-test
@@ -65,7 +77,7 @@ jobs:
           tools: ${{ steps.prepare-test.outputs.tools-url }}
       - uses: ./../action/autobuild
         env:
-      # Explicitly disable the CLR tracer.
+          # Explicitly disable the CLR tracer.
           COR_ENABLE_PROFILING: ''
           COR_PROFILER: ''
           COR_PROFILER_PATH_64: ''

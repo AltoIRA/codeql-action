@@ -2,11 +2,18 @@ import { TextDecoder } from "node:util";
 import path from "path";
 
 import * as github from "@actions/github";
-import { TestFn } from "ava";
+import test, {
+  type ThrownError,
+  type ThrowsExpectation,
+  type ExecutionContext,
+  type MacroDeclarationOptions,
+  type TestFn,
+} from "ava";
 import nock from "nock";
 import * as sinon from "sinon";
 
-import { getActionVersion } from "./actions-util";
+import { ActionState, StateFeature } from "./action-common";
+import { ActionsEnv, getActionVersion } from "./actions-util";
 import { AnalysisKind } from "./analyses";
 import * as apiClient from "./api-client";
 import { GitHubApiDetails } from "./api-client";
@@ -14,6 +21,7 @@ import { CachingKind } from "./caching-utils";
 import * as codeql from "./codeql";
 import { Config } from "./config-utils";
 import * as defaults from "./defaults.json";
+import { Env, ActionsEnvVars } from "./environment";
 import {
   CodeQLDefaultVersionInfo,
   Feature,
@@ -21,13 +29,16 @@ import {
   FeatureEnablement,
 } from "./feature-flags";
 import { Logger } from "./logging";
-import { OverlayDatabaseMode } from "./overlay-database-utils";
+import { OverlayDatabaseMode } from "./overlay/overlay-database-mode";
+import { ActionName } from "./status-report";
 import {
   DEFAULT_DEBUG_ARTIFACT_NAME,
   DEFAULT_DEBUG_DATABASE_NAME,
+  getEnv,
   GitHubVariant,
   GitHubVersion,
   HTTPError,
+  resetCachedCodeQlVersion,
 } from "./util";
 
 export const SAMPLE_DOTCOM_API_DETAILS = {
@@ -36,14 +47,18 @@ export const SAMPLE_DOTCOM_API_DETAILS = {
   apiURL: "https://api.github.com",
 };
 
-export const SAMPLE_DEFAULT_CLI_VERSION: CodeQLDefaultVersionInfo = {
-  cliVersion: "2.20.0",
-  tagName: "codeql-bundle-v2.20.0",
-};
-
 export const LINKED_CLI_VERSION = {
   cliVersion: defaults.cliVersion,
   tagName: defaults.bundleVersion,
+};
+
+export const SAMPLE_DEFAULT_CLI_VERSION: CodeQLDefaultVersionInfo = {
+  enabledVersions: [
+    {
+      cliVersion: "2.20.0",
+      tagName: "codeql-bundle-v2.20.0",
+    },
+  ],
 };
 
 type TestContext = {
@@ -85,13 +100,17 @@ function wrapOutput(context: TestContext) {
   };
 }
 
-export function setupTests(test: TestFn<any>) {
-  const typedTest = test as TestFn<TestContext>;
+export function setupTests(testFn: TestFn<any>) {
+  const typedTest = testFn as TestFn<TestContext>;
 
   typedTest.beforeEach((t) => {
     // Set an empty CodeQL object so that all method calls will fail
     // unless the test explicitly sets one up.
     codeql.setCodeQL({});
+
+    // Reset the in-process CodeQL version cache so that it doesn't leak between
+    // tests, which each represent a separate Actions step in production.
+    resetCachedCodeQlVersion();
 
     // Replace stdout and stderr so we can record output during tests
     t.context.testOutput = "";
@@ -139,45 +158,581 @@ export function setupTests(test: TestFn<any>) {
   });
 }
 
-// Sets environment variables that make using some libraries designed for
-// use only on actions safe to use outside of actions.
-export function setupActionsVars(tempDir: string, toolsDir: string) {
-  process.env["RUNNER_TEMP"] = tempDir;
-  process.env["RUNNER_TOOL_CACHE"] = toolsDir;
-  process.env["GITHUB_WORKSPACE"] = tempDir;
+/**
+ * Declare a reusable test implementation, with better type safety than `test.macro`.
+ */
+export function makeMacro<Args extends unknown[]>(
+  decl: MacroDeclarationOptions<Args, unknown>,
+) {
+  const m = test.macro<Args>(decl);
+
+  const wrapper = (name: string, ...args: Args) => test(name, m, ...args);
+  wrapper.test = (...args: Args) => test(m, ...args);
+  wrapper.serial = (name: string, ...args: Args) =>
+    test.serial(name, m, ...args);
+  // Make the implementation available as `fn`. We don't call it `exec` so
+  // that results from this function are not valid arguments to `test`
+  // or `test.serial`.
+  wrapper.fn = decl.exec;
+
+  return wrapper;
 }
 
+export function getTestEnv(testEnv: NodeJS.ProcessEnv = {}): Env {
+  return getEnv(testEnv);
+}
+
+/**
+ * Gets an `ActionsEnv` instance for use in tests.
+ */
+export function getTestActionsEnv(): ActionsEnv {
+  return {
+    getOptionalInput: () => undefined,
+  };
+}
+
+/** For testing purposes, we make all available state features accessible in `TestEnv`. */
+type AllState = [
+  "Base",
+  "Logger",
+  "Env",
+  "ReadOnlyEnv",
+  "Actions",
+  "Api",
+  "FeatureFlags",
+];
+
+/** Initialise a fresh `ActionState<AllState>` value. */
+export function initAllState(
+  overrides?: Partial<ActionState<AllState>>,
+): ActionState<AllState> {
+  return {
+    name: ActionName.Init,
+    startedAt: new Date(),
+    logger: new RecordingLogger(),
+    env: getTestEnv(),
+    actions: getTestActionsEnv(),
+    apiClient: github.getOctokit("123"),
+    features: createFeatures([]),
+    ...overrides,
+  };
+}
+
+type DelayedCheck<
+  Args extends readonly any[],
+  R,
+  Fs extends ReadonlyArray<AllState[number]>,
+> = (env: Readonly<BaseEnvBuilder<Args, R, Fs>>) => Promise<any>;
+
+export type ValueOrMutation<T> = T | ((val: T) => void);
+
+/**
+ * Wraps a function that accepts an `ActionState` for testing in different environments.
+ */
+abstract class BaseEnvBuilder<
+  Args extends readonly any[],
+  R,
+  Fs extends ReadonlyArray<AllState[number]>,
+> {
+  protected readonly fn: (state: ActionState<Fs>, ...args: Args) => R;
+  private logger: RecordingLogger;
+  protected state: ActionState<AllState>;
+  protected checks: Array<DelayedCheck<Args, R, Fs>>;
+
+  constructor(
+    fn: (state: ActionState<Fs>, ...args: Args) => R,
+    cloneFrom?: BaseEnvBuilder<Args, R, Fs>,
+  ) {
+    this.fn = fn;
+    this.logger = new RecordingLogger();
+    this.state =
+      cloneFrom !== undefined
+        ? ({
+            ...cloneFrom.state,
+            env: cloneFrom.state.env.clone(),
+            actions: Object.create(cloneFrom.state.actions),
+            logger: this.logger,
+          } satisfies ActionState<AllState>)
+        : initAllState({ logger: this.logger });
+    this.checks = [...(cloneFrom?.checks ?? [])];
+  }
+
+  /**
+   * Creates a clone of this object. Used internally.
+   * Must be overridden by subclasses.
+   */
+  protected abstract clone(): this;
+
+  public getLogger(): RecordingLogger {
+    return this.logger;
+  }
+
+  public getState(): ActionState<AllState> {
+    return this.state;
+  }
+
+  public withArgs(...args: Args): CallableEnvBuilder<Args, R, Fs> {
+    const result = new CallableEnvBuilder(this.fn, args, this.clone());
+    return result;
+  }
+
+  public withFeatures(enabled: Feature[]): this {
+    const result = this.clone();
+    result.state.features = createFeatures(enabled);
+    return result;
+  }
+
+  /**
+   * Sets environment variables that are always available to GitHub Actions,
+   * excluding some that are expected to be set to paths.
+   *
+   * @param overrides Overrides for the defaults.
+   */
+  public withDefaultActionsEnv(overrides?: ActionVarOverrides): this {
+    const result = this.clone();
+    setupBaseActionsVars(overrides, result.state.env);
+    return result;
+  }
+
+  /**
+   * Sets environment variables that are always available to GitHub Actions.
+   * @param tempDir A value for `RUNNER_TEMP` and `GITHUB_WORKSPACE`.
+   * @param toolsDir A value for `RUNNER_TOOL_CACHE`.
+   * @param overrides Overrides for the defaults.
+   */
+  public withActionsEnv(
+    tempDir: string,
+    toolsDir: string,
+    overrides?: ActionVarOverrides,
+  ): this {
+    const result = this.clone();
+    setupActionsVars(tempDir, toolsDir, overrides, result.state.env);
+    return result;
+  }
+
+  public withEnv(arg: ValueOrMutation<Env>): this {
+    const result = this.clone();
+    if (typeof arg === "function") {
+      arg(result.state.env);
+    } else {
+      result.state.env = arg;
+    }
+    return result;
+  }
+
+  public withActions(arg: ValueOrMutation<ActionsEnv>): this {
+    const result = this.clone();
+    if (typeof arg === "function") {
+      arg(result.state.actions);
+    } else {
+      result.state.actions = arg;
+    }
+    return result;
+  }
+
+  /**
+   * Adds a delayed check that `messages` are logged. The check will be
+   * performed after the main assertion passes.
+   */
+  public logs(t: ExecutionContext<unknown>, ...messages: string[]): this {
+    const result = this.clone();
+    result.checks.push(async (env) => {
+      checkExpectedLogMessages(t, env.getLogger().messages, messages);
+    });
+    return result;
+  }
+
+  /**
+   * Adds a delayed check that `messages` are not logged. The check will be
+   * performed after the main assertion passes.
+   */
+  public notLogs(t: ExecutionContext<unknown>, ...messages: string[]): this {
+    const result = this.clone();
+    result.checks.push(async (env) => {
+      checkUnexpectedLogMessages(t, env.getLogger().messages, messages);
+    });
+    return result;
+  }
+}
+
+class EnvBuilder<
+  Args extends readonly any[],
+  R,
+  Fs extends ReadonlyArray<AllState[number]>,
+> extends BaseEnvBuilder<Args, R, Fs> {
+  protected clone(): this {
+    return new EnvBuilder(this.fn, this) as this;
+  }
+}
+
+export interface PassedAssertion<R, T> {
+  result: Awaited<R>;
+  assertionResult: T;
+}
+
+/**
+ * A more minimal, exported interface for `CallableEnvBuilder`. This makes it easier to
+ * define helper functions in tests which expect a value of a compatible type.
+ */
+export interface AssertableTarget<R> {
+  passes<AArgs extends readonly any[], AResult>(
+    assertion: (val: Awaited<R>, ...assertionArgs: AArgs) => AResult,
+    ...assertionArgs: AArgs
+  ): Promise<PassedAssertion<R, AResult>>;
+
+  throws<ErrorType extends ErrorConstructor | Error>(
+    t: ExecutionContext<unknown>,
+    expectations?: ThrowsExpectation<ErrorType>,
+  ): Promise<ThrownError<ErrorType>>;
+}
+
+class CallableEnvBuilder<
+    Args extends readonly any[],
+    R,
+    Fs extends ReadonlyArray<AllState[number]>,
+  >
+  extends BaseEnvBuilder<Args, R, Fs>
+  implements AssertableTarget<R>
+{
+  private args: Args;
+
+  constructor(
+    fn: (state: ActionState<Fs>, ...args: Args) => R,
+    args: Args,
+    cloneFrom?: BaseEnvBuilder<Args, R, Fs>,
+  ) {
+    super(fn, cloneFrom);
+    this.args = args;
+  }
+
+  protected clone(): this {
+    return new CallableEnvBuilder(this.fn, this.args, this) as this;
+  }
+
+  public getArgs(): Args {
+    return this.args;
+  }
+
+  call(): R {
+    return this.fn(this.state as unknown as ActionState<Fs>, ...this.args);
+  }
+
+  /**
+   * Calls the underlying function in the configured environment and passes
+   * the result to `assertion` along with extra `assertionArgs`.
+   *
+   * @param assertion The assertion to apply to the result.
+   * @param assertionArgs Extra arguments for the assertion.
+   * @returns The result of the assertion.
+   */
+  public async passes<AArgs extends readonly any[], AResult>(
+    assertion: (val: Awaited<R>, ...assertionArgs: AArgs) => AResult,
+    ...assertionArgs: AArgs
+  ): Promise<PassedAssertion<R, AResult>> {
+    // this.call() may or may not return a promise,
+    // `Promise.resolve` turns the result into one if it isn't already,
+    // and we then await it. That ensures that `result` is an `Awaited<R>`.
+    const result = await Promise.resolve(this.call());
+
+    // Run the main assertion on the `result`.
+    const assertionResult = await assertion(result, ...assertionArgs);
+
+    // Run other delayed checks.
+    for (const delayedCheck of this.checks) {
+      await delayedCheck(this);
+    }
+
+    // Return the results of the function call and the main assertion.
+    return { result, assertionResult };
+  }
+
+  /**
+   * Asserts that calling the underlying function should throw an exception.
+   *
+   * @param t The execution context for the assertion.
+   * @param expectations Expectations for the error.
+   * @returns The error that was thrown.
+   */
+  public async throws<ErrorType extends ErrorConstructor | Error>(
+    t: ExecutionContext<unknown>,
+    expectations?: ThrowsExpectation<ErrorType>,
+  ): Promise<ThrownError<ErrorType>> {
+    // Run the main assertion.
+    const error = await t.throwsAsync(
+      async () => Promise.resolve(this.call()),
+      expectations,
+    );
+
+    // Run other delayed checks.
+    for (const delayedCheck of this.checks) {
+      await delayedCheck(this);
+    }
+
+    // Return the error.
+    return error;
+  }
+}
+
+/** Utility function to construct a `TestEnv`. */
+export function callee<
+  Args extends readonly any[],
+  R,
+  Fs extends readonly StateFeature[],
+>(fn: (state: ActionState<Fs>, ...args: Args) => R): EnvBuilder<Args, R, Fs> {
+  return new EnvBuilder(fn);
+}
+
+/**
+ * Default values for environment variables typically set in an Actions
+ * environment. Tests can override individual variables by passing them in the
+ * `overrides` parameter.
+ */
+export const DEFAULT_ACTIONS_VARS = {
+  GITHUB_ACTION_REPOSITORY: "github/codeql-action",
+  GITHUB_API_URL: "https://api.github.com",
+  GITHUB_EVENT_NAME: "push",
+  GITHUB_JOB: "test-job",
+  GITHUB_REF: "refs/heads/main",
+  GITHUB_REPOSITORY: "github/codeql-action-testing",
+  GITHUB_RUN_ATTEMPT: "1",
+  GITHUB_RUN_ID: "1",
+  GITHUB_SERVER_URL: "https://github.com",
+  GITHUB_SHA: "0".repeat(40),
+  GITHUB_WORKFLOW: "test-workflow",
+  RUNNER_NAME: "my-runner",
+  RUNNER_OS: "Linux",
+} as const satisfies Partial<Record<ActionsEnvVars, string>>;
+
+/** Partial mappings from GitHub Actions environment variables to values. */
+export type ActionVarOverrides = Partial<
+  Record<keyof typeof DEFAULT_ACTIONS_VARS, string>
+>;
+
+/**
+ * Sets environment variables that are always available on GitHub Actions,
+ * excluding some that are expected to be set to paths. See `setupActionsVars`.
+ *
+ * @param overrides Overrides for the defaults.
+ * @param env The environment to set the variables for.
+ */
+export function setupBaseActionsVars(
+  overrides?: ActionVarOverrides,
+  env: Env = getEnv(),
+) {
+  const vars = { ...DEFAULT_ACTIONS_VARS, ...overrides };
+  for (const [key, value] of Object.entries(vars)) {
+    env.set(key, value);
+  }
+}
+
+/**
+ * Sets environment variables that are always available on GitHub Actions.
+ *
+ * @param tempDir A value for `RUNNER_TEMP` and `GITHUB_WORKSPACE`.
+ * @param toolsDir A value for `RUNNER_TOOL_CACHE`.
+ * @param overrides Overrides for the defaults.
+ * @param env The environment to set the variables for.
+ */
+export function setupActionsVars(
+  tempDir: string,
+  toolsDir: string,
+  overrides?: ActionVarOverrides,
+  env: Env = getEnv(),
+) {
+  setupBaseActionsVars(overrides, env);
+  env.set(ActionsEnvVars.RUNNER_TEMP, tempDir);
+  env.set(ActionsEnvVars.RUNNER_TOOL_CACHE, toolsDir);
+  env.set(ActionsEnvVars.GITHUB_WORKSPACE, tempDir);
+}
+
+type LogLevel = "debug" | "info" | "warning" | "error";
+
 export interface LoggedMessage {
-  type: "debug" | "info" | "warning" | "error";
+  type: LogLevel;
   message: string | Error;
 }
 
-export function getRecordingLogger(messages: LoggedMessage[]): Logger {
-  return {
-    debug: (message: string) => {
-      messages.push({ type: "debug", message });
+export class RecordingLogger implements Logger {
+  messages: LoggedMessage[] = [];
+  readonly groups: string[] = [];
+  readonly unfinishedGroups: Set<string> = new Set();
+  private currentGroup: string | undefined = undefined;
+
+  constructor(private readonly logToConsole: boolean = true) {}
+
+  private addMessage(level: LogLevel, message: string | Error): void {
+    this.messages.push({ type: level, message });
+
+    if (this.logToConsole) {
       // eslint-disable-next-line no-console
       console.debug(message);
-    },
-    info: (message: string) => {
-      messages.push({ type: "info", message });
-      // eslint-disable-next-line no-console
-      console.info(message);
-    },
-    warning: (message: string | Error) => {
-      messages.push({ type: "warning", message });
-      // eslint-disable-next-line no-console
-      console.warn(message);
-    },
-    error: (message: string | Error) => {
-      messages.push({ type: "error", message });
-      // eslint-disable-next-line no-console
-      console.error(message);
-    },
-    isDebug: () => true,
-    startGroup: () => undefined,
-    endGroup: () => undefined,
-  };
+    }
+  }
+
+  /**
+   * Checks whether the logged messages contain `messageOrRegExp`.
+   *
+   * If `messageOrRegExp` is a string, this function returns true as long as
+   * `messageOrRegExp` appears as part of one of the `messages`.
+   *
+   * If `messageOrRegExp` is a regular expression, this function returns true as long as
+   * one of the `messages` matches `messageOrRegExp`.
+   */
+  hasMessage(messageOrRegExp: string | RegExp): boolean {
+    return hasLoggedMessage(this.messages, messageOrRegExp);
+  }
+
+  isDebug() {
+    return true;
+  }
+
+  debug(message: string) {
+    this.addMessage("debug", message);
+  }
+
+  info(message: string) {
+    this.addMessage("info", message);
+  }
+
+  warning(message: string | Error) {
+    this.addMessage("warning", message);
+  }
+
+  error(message: string | Error) {
+    this.addMessage("error", message);
+  }
+
+  startGroup(name: string) {
+    this.groups.push(name);
+    this.currentGroup = name;
+    this.unfinishedGroups.add(name);
+  }
+
+  endGroup() {
+    if (this.currentGroup !== undefined) {
+      this.unfinishedGroups.delete(this.currentGroup);
+    }
+    this.currentGroup = undefined;
+  }
+}
+
+export function getRecordingLogger(
+  messages: LoggedMessage[],
+  { logToConsole }: { logToConsole?: boolean } = { logToConsole: true },
+): Logger {
+  const logger = new RecordingLogger(logToConsole);
+  logger.messages = messages;
+  return logger;
+}
+
+/**
+ * Checks whether `messages` contains `messageOrRegExp`.
+ *
+ * If `messageOrRegExp` is a string, this function returns true as long as
+ * `messageOrRegExp` appears as part of one of the `messages`.
+ *
+ * If `messageOrRegExp` is a regular expression, this function returns true as long as
+ * one of the `messages` matches `messageOrRegExp`.
+ */
+function hasLoggedMessage(
+  messages: LoggedMessage[],
+  messageOrRegExp: string | RegExp,
+): boolean {
+  const check = (val: string) =>
+    typeof messageOrRegExp === "string"
+      ? val.includes(messageOrRegExp)
+      : messageOrRegExp.test(val);
+
+  return messages.some(
+    (msg) => typeof msg.message === "string" && check(msg.message),
+  );
+}
+
+/**
+ * Checks that `messages` contains all of `expectedMessages`.
+ */
+export function checkExpectedLogMessages(
+  t: ExecutionContext<any>,
+  messages: LoggedMessage[],
+  expectedMessages: string[],
+) {
+  const missingMessages: string[] = [];
+
+  for (const expectedMessage of expectedMessages) {
+    if (!hasLoggedMessage(messages, expectedMessage)) {
+      missingMessages.push(expectedMessage);
+    }
+  }
+
+  if (missingMessages.length > 0) {
+    const listify = (lines: string[]) =>
+      lines.map((m) => ` - '${m}'`).join("\n");
+
+    t.fail(
+      `Expected\n\n${listify(missingMessages)}\n\nin the logger output, but didn't find it in:\n\n${messages.map((m) => ` - '${m.message}'`).join("\n")}`,
+    );
+  } else {
+    t.pass();
+  }
+}
+
+/**
+ * Checks that `messages` contains none of `unexpectedMessages`.
+ */
+export function checkUnexpectedLogMessages(
+  t: ExecutionContext<any>,
+  messages: LoggedMessage[],
+  unexpectedMessages: string[],
+) {
+  const presentMessages: string[] = [];
+
+  for (const unexpectedMessage of unexpectedMessages) {
+    if (hasLoggedMessage(messages, unexpectedMessage)) {
+      presentMessages.push(unexpectedMessage);
+    }
+  }
+
+  if (presentMessages.length > 0) {
+    const listify = (lines: string[]) =>
+      lines.map((m) => ` - '${m}'`).join("\n");
+
+    t.fail(
+      `Did not expect\n\n${listify(presentMessages)}\n\nin the logger output, but found them in:\n\n${messages.map((m) => ` - '${m.message}'`).join("\n")}`,
+    );
+  } else {
+    t.pass();
+  }
+}
+
+/**
+ * Asserts that `message` should not have been logged to `logger`.
+ */
+export function assertNotLogged(
+  t: ExecutionContext<any>,
+  logger: RecordingLogger,
+  message: string | RegExp,
+) {
+  t.false(
+    logger.hasMessage(message),
+    `'${message}' should not have been logged, but was.`,
+  );
+}
+
+/**
+ * Initialises a recording logger and calls `body` with it.
+ *
+ * @param body The test that requires a recording logger.
+ * @returns The logged messages.
+ */
+export async function withRecordingLoggerAsync(
+  body: (logger: Logger) => Promise<void>,
+): Promise<LoggedMessage[]> {
+  const messages = [];
+  const logger = getRecordingLogger(messages);
+
+  await body(logger);
+
+  return messages;
 }
 
 /** Mock the HTTP request to the feature flags enablement API endpoint. */
@@ -284,11 +839,11 @@ export function mockCodeQLVersion(
  */
 export function createFeatures(enabledFeatures: Feature[]): FeatureEnablement {
   return {
-    getDefaultCliVersion: async () => {
+    getEnabledDefaultCliVersions: async () => {
       throw new Error("not implemented");
     },
     getValue: async (feature) => {
-      return enabledFeatures.includes(feature);
+      return enabledFeatures.includes(feature as Feature);
     },
   };
 }
@@ -375,11 +930,20 @@ export function createTestConfig(overrides: Partial<Config>): Config {
       trapCaches: {},
       trapCacheDownloadTime: 0,
       dependencyCachingEnabled: CachingKind.None,
+      dependencyCachingRestoredKeys: [],
       extraQueryExclusions: [],
       overlayDatabaseMode: OverlayDatabaseMode.None,
       useOverlayDatabaseCaching: false,
+      overlayModeSetExplicitly: false,
       repositoryProperties: {},
+      enableFileCoverageInformation: true,
     } satisfies Config,
     overrides,
   );
+}
+
+export function makeTestToken(length: number = 36) {
+  const chars =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  return chars.repeat(Math.ceil(length / chars.length)).slice(0, length);
 }

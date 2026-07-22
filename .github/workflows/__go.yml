@@ -8,11 +8,13 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
 on:
-  push:
-    paths:
-      - .github/workflows/__go.yml
   workflow_dispatch:
     inputs:
+      dotnet-version:
+        type: string
+        description: The version of .NET to install
+        required: false
+        default: 9.x
       go-version:
         type: string
         description: The version of Go to install
@@ -26,6 +28,7 @@ jobs:
       security-events: read
     uses: ./.github/workflows/__go-custom-queries.yml
     with:
+      dotnet-version: ${{ inputs.dotnet-version }}
       go-version: ${{ inputs.go-version }}
   go-indirect-tracing-workaround-diagnostic:
     name: 'Go: diagnostic when Go is changed after init step'

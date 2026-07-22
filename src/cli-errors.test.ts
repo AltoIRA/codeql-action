@@ -131,27 +131,30 @@ for (const [platform, arch] of [
   ["linux", "arm64"],
   ["win32", "arm64"],
 ]) {
-  test(`wrapCliConfigurationError - ${platform}/${arch} unsupported`, (t) => {
-    sinon.stub(process, "platform").value(platform);
-    sinon.stub(process, "arch").value(arch);
-    const commandError = new CommandInvocationError(
-      "codeql",
-      ["version"],
-      1,
-      "Some error",
-    );
-    const cliError = new CliError(commandError);
+  test.serial(
+    `wrapCliConfigurationError - ${platform}/${arch} unsupported`,
+    (t) => {
+      sinon.stub(process, "platform").value(platform);
+      sinon.stub(process, "arch").value(arch);
+      const commandError = new CommandInvocationError(
+        "codeql",
+        ["version"],
+        1,
+        "Some error",
+      );
+      const cliError = new CliError(commandError);
 
-    const wrappedError = wrapCliConfigurationError(cliError);
+      const wrappedError = wrapCliConfigurationError(cliError);
 
-    t.true(wrappedError instanceof ConfigurationError);
-    t.true(
-      wrappedError.message.includes(
-        "CodeQL CLI does not support the platform/architecture combination",
-      ),
-    );
-    t.true(wrappedError.message.includes(`${platform}/${arch}`));
-  });
+      t.true(wrappedError instanceof ConfigurationError);
+      t.true(
+        wrappedError.message.includes(
+          "CodeQL CLI does not support the platform/architecture combination",
+        ),
+      );
+      t.true(wrappedError.message.includes(`${platform}/${arch}`));
+    },
+  );
 }
 
 test("wrapCliConfigurationError - supported platform", (t) => {
@@ -296,12 +299,40 @@ test("wrapCliConfigurationError - swift build failed", (t) => {
   t.true(wrappedError instanceof ConfigurationError);
 });
 
+test("wrapCliConfigurationError - swift incompatible os", (t) => {
+  const commandError = new CommandInvocationError(
+    "codeql",
+    ["swift/tools/autobuild.sh"],
+    1,
+    "2026-04-01 18:35:00 EST ERRO [extractor/main] [incompatible-os] Currently, Swift analysis is only supported on macOS. (IncompatibleOs.cpp:26)",
+  );
+  const cliError = new CliError(commandError);
+
+  const wrappedError = wrapCliConfigurationError(cliError);
+
+  t.true(wrappedError instanceof ConfigurationError);
+});
+
 test("wrapCliConfigurationError - pack cannot be found", (t) => {
   const commandError = new CommandInvocationError(
     "codeql",
     ["pack", "install"],
     1,
     "Query pack my-pack cannot be found. Check the spelling of the pack.",
+  );
+  const cliError = new CliError(commandError);
+
+  const wrappedError = wrapCliConfigurationError(cliError);
+
+  t.true(wrappedError instanceof ConfigurationError);
+});
+
+test("wrapCliConfigurationError - unknown query file", (t) => {
+  const commandError = new CommandInvocationError(
+    "codeql",
+    ["database", "init"],
+    2,
+    "my-query-file is not a .ql file, .qls file, a directory, or a query pack specification. See the logs for more details.",
   );
   const cliError = new CliError(commandError);
 

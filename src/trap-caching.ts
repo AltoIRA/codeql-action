@@ -13,8 +13,8 @@ import * as gitUtils from "./git-utils";
 import { Language } from "./languages";
 import { Logger } from "./logging";
 import {
+  asHTTPError,
   getErrorMessage,
-  isHTTPError,
   tryGetFolderBytes,
   waitForResultWithTimeLimit,
 } from "./util";
@@ -185,6 +185,10 @@ export async function cleanupTrapCaches(
       trap_cache_cleanup_skipped_because: "feature disabled",
     };
   }
+  logger.warning(
+    "TRAP cache cleanup is deprecated and will be removed in May 2026. " +
+      "We recommend instead disabling TRAP caching by passing the `trap-caching: false` input to the `init` Action.",
+  );
   if (!(await gitUtils.isAnalyzingDefaultBranch())) {
     return {
       trap_cache_cleanup_skipped_because: "not analyzing default branch",
@@ -236,7 +240,7 @@ export async function cleanupTrapCaches(
     }
     return { trap_cache_cleanup_size_bytes: totalBytesCleanedUp };
   } catch (e) {
-    if (isHTTPError(e) && e.status === 403) {
+    if (asHTTPError(e)?.status === 403) {
       logger.warning(
         "Could not cleanup TRAP caches as the token did not have the required permissions. " +
           'To clean up TRAP caches, ensure the token has the "actions:write" permission. ' +
@@ -276,7 +280,7 @@ export async function getLanguagesSupportingCaching(
   logger: Logger,
 ): Promise<Language[]> {
   const result: Language[] = [];
-  const resolveResult = await codeql.betterResolveLanguages();
+  const resolveResult = await codeql.resolveLanguages();
   outer: for (const lang of languages) {
     const extractorsForLanguage = resolveResult.extractors[lang];
     if (extractorsForLanguage === undefined) {

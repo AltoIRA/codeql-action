@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 
+import { Action, ActionState, runInActions } from "./action-common";
 import {
   getActionVersion,
   getOptionalInput,
@@ -11,7 +12,7 @@ import { getCodeQL } from "./codeql";
 import { Config, getConfig } from "./config-utils";
 import { EnvVar } from "./environment";
 import { Language } from "./languages";
-import { Logger, getActionsLogger } from "./logging";
+import { Logger } from "./logging";
 import {
   StatusReportBase,
   getActionsStatus,
@@ -25,7 +26,6 @@ import {
   checkDiskUsage,
   checkGitHubVersionInRange,
   ConfigurationError,
-  getErrorMessage,
   initializeEnvironment,
   wrapError,
 } from "./util";
@@ -68,9 +68,10 @@ async function sendCompletedStatusReport(
   }
 }
 
-async function run() {
-  const startedAt = new Date();
-  const logger = getActionsLogger();
+async function run({ startedAt, logger }: ActionState<["Base", "Logger"]>) {
+  // To capture errors appropriately, keep as much code within the try-catch as
+  // possible, and only use safe functions outside.
+
   let config: Config | undefined;
   let currentLanguage: Language | undefined;
   let languages: Language[] | undefined;
@@ -139,12 +140,12 @@ async function run() {
   await sendCompletedStatusReport(config, logger, startedAt, languages ?? []);
 }
 
-async function runWrapper() {
-  try {
-    await run();
-  } catch (error) {
-    core.setFailed(`autobuild action failed. ${getErrorMessage(error)}`);
-  }
-}
+/** Defines the `autobuild` Action. */
+const autobuild: Action = {
+  name: ActionName.Autobuild,
+  run,
+};
 
-void runWrapper();
+export async function runWrapper() {
+  await runInActions(autobuild);
+}

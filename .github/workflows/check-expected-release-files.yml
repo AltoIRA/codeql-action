@@ -5,9 +5,10 @@ on:
     paths:
       - .github/workflows/check-expected-release-files.yml
       - src/defaults.json
-    # Run checks on reopened draft PRs to support triggering PR checks on draft PRs that were opened
-    # by other workflows.
-    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || false }}
+  group: ${{ github.workflow }}-${{ github.ref }}
 
 defaults:
   run:
@@ -15,14 +16,14 @@ defaults:
 
 jobs:
   check-expected-release-files:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
 
     permissions:
       contents: read
 
     steps:
       - name: Checkout CodeQL Action
-        uses: actions/checkout@v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Check Expected Release Files
         run: |
           bundle_version="$(cat "./src/defaults.json" | jq -r ".bundleVersion")"

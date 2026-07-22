@@ -14,11 +14,36 @@ export function getConfigFileDoesNotExistErrorMessage(
   return `The configuration file "${configFile}" does not exist`;
 }
 
-export function getConfigFileRepoFormatInvalidMessage(
+export function getConfigFileParseErrorMessage(
+  configFile: string,
+  message: string,
+): string {
+  return `Cannot parse "${configFile}": ${message}`;
+}
+
+export function getInvalidConfigFileMessage(
+  configFile: string,
+  messages: string[],
+): string {
+  const andMore =
+    messages.length > 10 ? `, and ${messages.length - 10} more.` : ".";
+  return `The configuration file "${configFile}" is invalid: ${messages.slice(0, 10).join(", ")}${andMore}`;
+}
+
+export function getConfigFileRepoOldFormatInvalidMessage(
   configFile: string,
 ): string {
   let error = `The configuration file "${configFile}" is not a supported remote file reference.`;
   error += " Expected format <owner>/<repository>/<file-path>@<ref>";
+
+  return error;
+}
+
+export function getConfigFileRepoFormatInvalidMessage(
+  configFile: string,
+): string {
+  let error = `The configuration file "${configFile}" is not a supported remote file reference.`;
+  error += " Expected format [<owner>/]<repository>[@<ref>][:<file-path>]";
 
   return error;
 }

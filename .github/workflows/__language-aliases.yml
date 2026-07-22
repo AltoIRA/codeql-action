@@ -12,12 +12,10 @@ on:
     branches:
       - main
       - releases/v*
-  pull_request:
+  pull_request: {}
+  merge_group:
     types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
+      - checks_requested
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
@@ -28,8 +26,8 @@ defaults:
   run:
     shell: bash
 concurrency:
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || false }}
+  group: language-aliases-${{github.ref}}
 jobs:
   language-aliases:
     strategy:
@@ -47,7 +45,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Prepare test
         id: prepare-test
         uses: ./.github/actions/prepare-test
@@ -57,12 +55,12 @@ jobs:
           setup-kotlin: 'true'
       - uses: ./../action/init
         with:
-          languages: C#,java-kotlin,swift,typescript
+          languages: C#,java-kotlin,typescript
           tools: ${{ steps.prepare-test.outputs.tools-url }}
 
-      - name: Check languages
+      - name: 'Check languages'
         run: |
-          expected_languages="csharp,java,swift,javascript"
+          expected_languages="csharp,java,javascript"
           actual_languages=$(jq -r '.languages | join(",")' "$RUNNER_TEMP"/config)
 
           if [ "$expected_languages" != "$actual_languages" ]; then

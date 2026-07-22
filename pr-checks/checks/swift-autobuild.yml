@@ -1,7 +1,10 @@
 name: "Swift analysis using autobuild"
 description: "Tests creation of a Swift database using autobuild"
-versions: ["nightly-latest"]
-operatingSystems: ["macos"]
+versions:
+  - nightly-latest
+operatingSystems:
+  - os: macos
+    runner-image: macos-latest-xlarge
 steps:
   - uses: ./../action/init
     id: init

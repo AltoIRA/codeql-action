@@ -12,12 +12,10 @@ on:
     branches:
       - main
       - releases/v*
-  pull_request:
+  pull_request: {}
+  merge_group:
     types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
+      - checks_requested
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
@@ -28,8 +26,8 @@ defaults:
   run:
     shell: bash
 concurrency:
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || false }}
+  group: rust-${{github.ref}}
 jobs:
   rust:
     strategy:
@@ -37,7 +35,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            version: stable-v2.19.3
+            version: stable-v2.19.4
           - os: ubuntu-latest
             version: stable-v2.22.1
           - os: ubuntu-latest
@@ -55,7 +53,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Prepare test
         id: prepare-test
         uses: ./.github/actions/prepare-test

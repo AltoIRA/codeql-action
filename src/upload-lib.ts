@@ -21,7 +21,14 @@ import * as gitUtils from "./git-utils";
 import { initCodeQL } from "./init";
 import { Logger } from "./logging";
 import { getRepositoryNwo, RepositoryNwo } from "./repository";
-import { ToolsFeature } from "./tools-features";
+import * as sarif from "./sarif";
+import {
+  areAllRunsProducedByCodeQL,
+  areAllRunsUnique,
+  combineSarifFiles,
+  InvalidSarifUploadError,
+} from "./sarif";
+import { BasePayload, UploadPayload } from "./upload-lib/types";
 import * as util from "./util";
 import {
   ConfigurationError,
@@ -30,8 +37,6 @@ import {
   GitHubVariant,
   GitHubVersion,
   satisfiesGHESVersion,
-  SarifFile,
-  SarifRun,
 } from "./util";
 
 const GENERIC_403_MSG =
@@ -39,104 +44,10 @@ const GENERIC_403_MSG =
 const GENERIC_404_MSG =
   "The CodeQL code scanning feature is forbidden on this repository.";
 
-// Takes a list of paths to sarif files and combines them together,
-// returning the contents of the combined sarif file.
-function combineSarifFiles(sarifFiles: string[], logger: Logger): SarifFile {
-  logger.info(`Loading SARIF file(s)`);
-  const combinedSarif: SarifFile = {
-    version: null,
-    runs: [],
-  };
-
-  for (const sarifFile of sarifFiles) {
-    logger.debug(`Loading SARIF file: ${sarifFile}`);
-    const sarifObject = JSON.parse(
-      fs.readFileSync(sarifFile, "utf8"),
-    ) as SarifFile;
-    // Check SARIF version
-    if (combinedSarif.version === null) {
-      combinedSarif.version = sarifObject.version;
-    } else if (combinedSarif.version !== sarifObject.version) {
-      throw new InvalidSarifUploadError(
-        `Different SARIF versions encountered: ${combinedSarif.version} and ${sarifObject.version}`,
-      );
-    }
-
-    combinedSarif.runs.push(...sarifObject.runs);
-  }
-
-  return combinedSarif;
-}
-
-/**
- * Checks whether all the runs in the given SARIF files were produced by CodeQL.
- * @param sarifObjects The list of SARIF objects to check.
- */
-function areAllRunsProducedByCodeQL(sarifObjects: SarifFile[]): boolean {
-  return sarifObjects.every((sarifObject) => {
-    return sarifObject.runs?.every(
-      (run) => run.tool?.driver?.name === "CodeQL",
-    );
-  });
-}
-
-type SarifRunKey = {
-  name: string | undefined;
-  fullName: string | undefined;
-  version: string | undefined;
-  semanticVersion: string | undefined;
-  guid: string | undefined;
-  automationId: string | undefined;
-};
-
-function createRunKey(run: SarifRun): SarifRunKey {
-  return {
-    name: run.tool?.driver?.name,
-    fullName: run.tool?.driver?.fullName,
-    version: run.tool?.driver?.version,
-    semanticVersion: run.tool?.driver?.semanticVersion,
-    guid: run.tool?.driver?.guid,
-    automationId: run.automationDetails?.id,
-  };
-}
-
-/**
- * Checks whether all runs in the given SARIF files are unique (based on the
- * criteria used by Code Scanning to determine analysis categories).
- * @param sarifObjects The list of SARIF objects to check.
- */
-function areAllRunsUnique(sarifObjects: SarifFile[]): boolean {
-  const keys = new Set<string>();
-
-  for (const sarifObject of sarifObjects) {
-    for (const run of sarifObject.runs) {
-      const key = JSON.stringify(createRunKey(run));
-
-      // If the key already exists, the runs are not unique.
-      if (keys.has(key)) {
-        return false;
-      }
-
-      keys.add(key);
-    }
-  }
-
-  return true;
-}
-
 // Checks whether the deprecation warning for combining SARIF files should be shown.
 export async function shouldShowCombineSarifFilesDeprecationWarning(
-  sarifObjects: util.SarifFile[],
-  githubVersion: GitHubVersion,
+  sarifObjects: Array<Partial<sarif.Log>>,
 ) {
-  // Do not show this warning on GHES versions before 3.14.0
-  if (
-    githubVersion.type === GitHubVariant.GHES &&
-    satisfiesGHESVersion(githubVersion.version, "<3.14", true)
-  ) {
-    return false;
-  }
-
   // Only give a deprecation warning when not all runs are unique and
   // we haven't already shown the warning.
   return (
@@ -146,7 +57,7 @@ export async function shouldShowCombineSarifFilesDeprecationWarning(
 }
 
 export async function throwIfCombineSarifFilesDisabled(
-  sarifObjects: util.SarifFile[],
+  sarifObjects: Array<Partial<sarif.Log>>,
   githubVersion: GitHubVersion,
 ) {
   if (!(await shouldDisableCombineSarifFiles(sarifObjects, githubVersion))) {
@@ -163,7 +74,7 @@ export async function throwIfCombineSarifFilesDisabled(
 
 // Checks whether combining SARIF files should be disabled.
 async function shouldDisableCombineSarifFiles(
-  sarifObjects: util.SarifFile[],
+  sarifObjects: Array<Partial<sarif.Log>>,
   githubVersion: GitHubVersion,
 ) {
   if (githubVersion.type === GitHubVariant.GHES) {
@@ -192,12 +103,10 @@ async function combineSarifFilesUsingCLI(
   gitHubVersion: GitHubVersion,
   features: FeatureEnablement,
   logger: Logger,
-): Promise<SarifFile> {
+): Promise<Partial<sarif.Log>> {
   logger.info("Combining SARIF files using the CodeQL CLI");
 
-  const sarifObjects = sarifFiles.map((sarifFile): SarifFile => {
-    return JSON.parse(fs.readFileSync(sarifFile, "utf8")) as SarifFile;
-  });
+  const sarifObjects = sarifFiles.map(sarif.readSarifFile);
 
   const deprecationWarningMessage =
     gitHubVersion.type === GitHubVariant.GHES
@@ -213,12 +122,7 @@ async function combineSarifFilesUsingCLI(
       "Not all SARIF files were produced by CodeQL. Merging files in the action.",
     );
 
-    if (
-      await shouldShowCombineSarifFilesDeprecationWarning(
-        sarifObjects,
-        gitHubVersion,
-      )
-    ) {
+    if (await shouldShowCombineSarifFilesDeprecationWarning(sarifObjects)) {
       logger.warning(
         `Uploading multiple SARIF runs with the same category is deprecated ${deprecationWarningMessage}. Please update your workflow to upload a single run per category. ${deprecationMoreInformationMessage}`,
       );
@@ -252,9 +156,8 @@ async function combineSarifFilesUsingCLI(
       apiURL: getRequiredEnvParam("GITHUB_API_URL"),
     };
 
-    const codeQLDefaultVersionInfo = await features.getDefaultCliVersion(
-      gitHubVersion.type,
-    );
+    const codeQLDefaultVersionInfo =
+      await features.getEnabledDefaultCliVersions(gitHubVersion.type);
 
     const initCodeQLResult = await initCodeQL(
       undefined, // There is no tools input on the upload action
@@ -262,36 +165,13 @@ async function combineSarifFilesUsingCLI(
       tempDir,
       gitHubVersion.type,
       codeQLDefaultVersionInfo,
+      undefined, // rawLanguages: upload-lib does not run analysis
+      false, // useOverlayAwareDefaultCliVersion: upload-lib does not run analysis
+      features,
       logger,
     );
 
     codeQL = initCodeQLResult.codeql;
-  }
-
-  if (
-    !(await codeQL.supportsFeature(
-      ToolsFeature.SarifMergeRunsFromEqualCategory,
-    ))
-  ) {
-    await throwIfCombineSarifFilesDisabled(sarifObjects, gitHubVersion);
-
-    logger.warning(
-      "The CodeQL CLI does not support merging SARIF files. Merging files in the action.",
-    );
-
-    if (
-      await shouldShowCombineSarifFilesDeprecationWarning(
-        sarifObjects,
-        gitHubVersion,
-      )
-    ) {
-      logger.warning(
-        `Uploading multiple CodeQL runs with the same category is deprecated ${deprecationWarningMessage} for CodeQL CLI 2.16.6 and earlier. Please update your CodeQL CLI version or update your workflow to set a distinct category for each CodeQL run. ${deprecationMoreInformationMessage}`,
-      );
-      core.exportVariable("CODEQL_MERGE_SARIF_DEPRECATION_WARNING", "true");
-    }
-
-    return combineSarifFiles(sarifFiles, logger);
   }
 
   const baseTempDir = path.resolve(tempDir, "combined-sarif");
@@ -304,30 +184,30 @@ async function combineSarifFilesUsingCLI(
     mergeRunsFromEqualCategory: true,
   });
 
-  return JSON.parse(fs.readFileSync(outputFile, "utf8")) as SarifFile;
+  return sarif.readSarifFile(outputFile);
 }
 
 // Populates the run.automationDetails.id field using the analysis_key and environment
 // and return an updated sarif file contents.
 export function populateRunAutomationDetails(
-  sarif: SarifFile,
+  sarifFile: Partial<sarif.Log>,
   category: string | undefined,
   analysis_key: string,
   environment: string | undefined,
-): SarifFile {
+): Partial<sarif.Log> {
   const automationID = getAutomationID(category, analysis_key, environment);
 
   if (automationID !== undefined) {
-    for (const run of sarif.runs || []) {
+    for (const run of sarifFile.runs || []) {
       if (run.automationDetails === undefined) {
         run.automationDetails = {
           id: automationID,
         };
       }
     }
-    return sarif;
+    return sarifFile;
   }
-  return sarif;
+  return sarifFile;
 }
 
 function getAutomationID(
@@ -346,10 +226,13 @@ function getAutomationID(
   return api.computeAutomationID(analysis_key, environment);
 }
 
-// Upload the given payload.
-// If the request fails then this will retry a small number of times.
-async function uploadPayload(
-  payload: any,
+/**
+ * Upload the given payload.
+ * If the request fails then this will retry a small number of times.
+ * This is exported for testing purposes only.
+ */
+export async function uploadPayload(
+  payload: BasePayload,
   repositoryNwo: RepositoryNwo,
   logger: Logger,
   analysis: analyses.AnalysisConfig,
@@ -382,16 +265,17 @@ async function uploadPayload(
     logger.info("Successfully uploaded results");
     return response.data.id as string;
   } catch (e) {
-    if (util.isHTTPError(e)) {
-      switch (e.status) {
+    const httpError = util.asHTTPError(e);
+    if (httpError !== undefined) {
+      switch (httpError.status) {
         case 403:
-          core.warning(e.message || GENERIC_403_MSG);
+          core.warning(httpError.message || GENERIC_403_MSG);
           break;
         case 404:
-          core.warning(e.message || GENERIC_404_MSG);
+          core.warning(httpError.message || GENERIC_404_MSG);
           break;
         default:
-          core.warning(e.message);
+          core.warning(httpError.message);
           break;
       }
     }
@@ -434,7 +318,7 @@ export function findSarifFilesInDir(
   return sarifFiles;
 }
 
-export function getSarifFilePaths(
+function getSarifFilePaths(
   sarifPath: string,
   isSarif: (name: string) => boolean,
 ) {
@@ -532,9 +416,9 @@ export async function getGroupedSarifFilePaths(
 }
 
 // Counts the number of results in the given SARIF file
-function countResultsInSarif(sarif: string): number {
+function countResultsInSarif(sarifLog: string): number {
   let numResults = 0;
-  const parsedSarif = JSON.parse(sarif);
+  const parsedSarif = JSON.parse(sarifLog);
   if (!Array.isArray(parsedSarif.runs)) {
     throw new InvalidSarifUploadError("Invalid SARIF. Missing 'runs' array.");
   }
@@ -550,9 +434,15 @@ function countResultsInSarif(sarif: string): number {
   return numResults;
 }
 
-export function readSarifFile(sarifFilePath: string): SarifFile {
+/** A thin wrapper around `readSarifFile` which wraps exceptions in `InvalidSarifUploadError`.
+ *
+ * @throws InvalidSarifUploadError If parsing the SARIF file as JSON failed.
+ */
+export function readSarifFileOrThrow(
+  sarifFilePath: string,
+): Partial<sarif.Log> {
   try {
-    return JSON.parse(fs.readFileSync(sarifFilePath, "utf8")) as SarifFile;
+    return sarif.readSarifFile(sarifFilePath);
   } catch (e) {
     throw new InvalidSarifUploadError(
       `Invalid SARIF. JSON syntax error: ${getErrorMessage(e)}`,
@@ -563,26 +453,26 @@ export function readSarifFile(sarifFilePath: string): SarifFile {
 // Validates the given SARIF object and throws an error if the SARIF object is invalid.
 // The file path is only used in error messages to improve clarity.
 export function validateSarifFileSchema(
-  sarif: SarifFile,
+  sarifLog: Partial<sarif.Log>,
   sarifFilePath: string,
   logger: Logger,
-) {
+): sarifLog is sarif.Log {
   if (
-    areAllRunsProducedByCodeQL([sarif]) &&
+    areAllRunsProducedByCodeQL([sarifLog]) &&
     // We want to validate CodeQL SARIF in testing environments.
     !util.getTestingEnvironment()
   ) {
     logger.debug(
       `Skipping SARIF schema validation for ${sarifFilePath} as all runs are produced by CodeQL.`,
     );
-    return;
+    return true;
   }
 
   logger.info(`Validating ${sarifFilePath}`);
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const schema = require("../src/sarif-schema-2.1.0.json") as jsonschema.Schema;
 
-  const result = new jsonschema.Validator().validate(sarif, schema);
+  const result = new jsonschema.Validator().validate(sarifLog, schema);
   // Filter errors related to invalid URIs in the artifactLocation field as this
   // is a breaking change. See https://github.com/github/codeql-action/issues/1703
   const warningAttributes = ["uri-reference", "uri"];
@@ -624,6 +514,8 @@ export function validateSarifFileSchema(
       )}`,
     );
   }
+
+  return true;
 }
 
 // buildPayload constructs a map ready to be uploaded to the API from the given
@@ -640,8 +532,8 @@ export function buildPayload(
   environment: string | undefined,
   toolNames: string[],
   mergeBaseCommitOid: string | undefined,
-) {
-  const payloadObj = {
+): UploadPayload {
+  const payloadObj: UploadPayload = {
     commit_oid: commitOid,
     ref,
     analysis_key: analysisKey,
@@ -683,6 +575,107 @@ export function buildPayload(
   return payloadObj;
 }
 
+export interface PostProcessingResults {
+  sarif: Partial<sarif.Log>;
+  analysisKey: string;
+  environment: string;
+}
+
+/**
+ * Performs post-processing of the SARIF files given by `sarifPaths`.
+ *
+ * @param logger The logger to use.
+ * @param features Information about enabled features.
+ * @param checkoutPath The path where the repo was checked out at.
+ * @param sarifPaths The paths of the SARIF files to post-process.
+ * @param category The analysis category.
+ * @param analysis The analysis configuration.
+ *
+ * @returns Returns the results of post-processing the SARIF files,
+ *          including the resulting SARIF file.
+ */
+export async function postProcessSarifFiles(
+  logger: Logger,
+  features: FeatureEnablement,
+  checkoutPath: string,
+  sarifPaths: string[],
+  category: string | undefined,
+  analysis: analyses.AnalysisConfig,
+): Promise<PostProcessingResults> {
+  logger.info(`Post-processing sarif files: ${JSON.stringify(sarifPaths)}`);
+
+  const gitHubVersion = await getGitHubVersion();
+
+  let sarifLog: Partial<sarif.Log>;
+  category = analysis.fixCategory(logger, category);
+
+  if (sarifPaths.length > 1) {
+    // Validate that the files we were asked to upload are all valid SARIF files
+    for (const sarifPath of sarifPaths) {
+      const parsedSarif = readSarifFileOrThrow(sarifPath);
+      validateSarifFileSchema(parsedSarif, sarifPath, logger);
+    }
+
+    sarifLog = await combineSarifFilesUsingCLI(
+      sarifPaths,
+      gitHubVersion,
+      features,
+      logger,
+    );
+  } else {
+    const sarifPath = sarifPaths[0];
+    sarifLog = readSarifFileOrThrow(sarifPath);
+    validateSarifFileSchema(sarifLog, sarifPath, logger);
+
+    // Validate that there are no runs for the same category
+    await throwIfCombineSarifFilesDisabled([sarifLog], gitHubVersion);
+  }
+
+  sarifLog = filterAlertsByDiffRange(logger, sarifLog);
+  sarifLog = await fingerprints.addFingerprints(sarifLog, checkoutPath, logger);
+
+  const analysisKey = await api.getAnalysisKey();
+  const environment = actionsUtil.getRequiredInput("matrix");
+  sarifLog = populateRunAutomationDetails(
+    sarifLog,
+    category,
+    analysisKey,
+    environment,
+  );
+
+  return { sarif: sarifLog, analysisKey, environment };
+}
+
+/**
+ * Writes the post-processed SARIF file to disk, if needed based on `pathInput` or the `SARIF_DUMP_DIR`.
+ *
+ * @param logger The logger to use.
+ * @param pathInput The input provided for `post-processed-sarif-path`.
+ * @param uploadTarget The upload target.
+ * @param postProcessingResults The results of post-processing SARIF files.
+ */
+export async function writePostProcessedFiles(
+  logger: Logger,
+  pathInput: string | undefined,
+  uploadTarget: analyses.AnalysisConfig,
+  postProcessingResults: PostProcessingResults,
+) {
+  // If there's an explicit input, use that. Otherwise, use the value from the environment variable.
+  const outputPath = pathInput || util.getOptionalEnvVar(EnvVar.SARIF_DUMP_DIR);
+
+  // If we have a non-empty output path, write the SARIF file to it.
+  if (outputPath !== undefined) {
+    dumpSarifFile(
+      JSON.stringify(postProcessingResults.sarif),
+      outputPath,
+      logger,
+      uploadTarget,
+    );
+  } else {
+    logger.debug(`Not writing post-processed SARIF files.`);
+  }
+}
+
 /**
  * Uploads a single SARIF file or a directory of SARIF files depending on what `inputSarifPath` refers
  * to.
@@ -713,7 +706,7 @@ export async function uploadFiles(
 /**
  * Uploads the given array of SARIF files.
  */
-export async function uploadSpecifiedFiles(
+async function uploadSpecifiedFiles(
   sarifPaths: string[],
   checkoutPath: string,
   category: string | undefined,
@@ -721,76 +714,67 @@ export async function uploadSpecifiedFiles(
   logger: Logger,
   uploadTarget: analyses.AnalysisConfig,
 ): Promise<UploadResult> {
-  logger.startGroup(`Uploading ${uploadTarget.name} results`);
-  logger.info(`Processing sarif files: ${JSON.stringify(sarifPaths)}`);
-
-  const gitHubVersion = await getGitHubVersion();
-
-  let sarif: SarifFile;
-  category = uploadTarget.fixCategory(logger, category);
-
-  if (sarifPaths.length > 1) {
-    // Validate that the files we were asked to upload are all valid SARIF files
-    for (const sarifPath of sarifPaths) {
-      const parsedSarif = readSarifFile(sarifPath);
-      validateSarifFileSchema(parsedSarif, sarifPath, logger);
-    }
-
-    sarif = await combineSarifFilesUsingCLI(
-      sarifPaths,
-      gitHubVersion,
-      features,
-      logger,
-    );
-  } else {
-    const sarifPath = sarifPaths[0];
-    sarif = readSarifFile(sarifPath);
-    validateSarifFileSchema(sarif, sarifPath, logger);
-
-    // Validate that there are no runs for the same category
-    await throwIfCombineSarifFilesDisabled([sarif], gitHubVersion);
-  }
-
-  sarif = filterAlertsByDiffRange(logger, sarif);
-  sarif = await fingerprints.addFingerprints(sarif, checkoutPath, logger);
-
-  const analysisKey = await api.getAnalysisKey();
-  const environment = actionsUtil.getRequiredInput("matrix");
-  sarif = populateRunAutomationDetails(
-    sarif,
+  const processingResults: PostProcessingResults = await postProcessSarifFiles(
+    logger,
+    features,
+    checkoutPath,
+    sarifPaths,
     category,
-    analysisKey,
-    environment,
+    uploadTarget,
   );
 
-  const toolNames = util.getToolNames(sarif);
+  return uploadPostProcessedFiles(
+    logger,
+    checkoutPath,
+    uploadTarget,
+    processingResults,
+  );
+}
+
+/**
+ * Uploads the results of post-processing SARIF files to the specified upload target.
+ *
+ * @param logger The logger to use.
+ * @param checkoutPath The path at which the repository was checked out.
+ * @param uploadTarget The analysis configuration.
+ * @param postProcessingResults The results of post-processing SARIF files.
+ *
+ * @returns The results of uploading the `postProcessingResults` to `uploadTarget`.
+ */
+export async function uploadPostProcessedFiles(
+  logger: Logger,
+  checkoutPath: string,
+  uploadTarget: analyses.AnalysisConfig,
+  postProcessingResults: PostProcessingResults,
+): Promise<UploadResult> {
+  logger.startGroup(`Uploading ${uploadTarget.name} results`);
+
+  const sarifLog = postProcessingResults.sarif;
+  const toolNames = sarif.getToolNames(sarifLog);
 
   logger.debug(`Validating that each SARIF run has a unique category`);
-  validateUniqueCategory(sarif, uploadTarget.sentinelPrefix);
+  validateUniqueCategory(sarifLog, uploadTarget.sentinelPrefix);
   logger.debug(`Serializing SARIF for upload`);
-  const sarifPayload = JSON.stringify(sarif);
-
-  const dumpDir = process.env[EnvVar.SARIF_DUMP_DIR];
-  if (dumpDir) {
-    dumpSarifFile(sarifPayload, dumpDir, logger, uploadTarget);
-  }
+  const sarifPayload = JSON.stringify(sarifLog);
 
   logger.debug(`Compressing serialized SARIF`);
   const zippedSarif = zlib.gzipSync(sarifPayload).toString("base64");
   const checkoutURI = url.pathToFileURL(checkoutPath).href;
 
-  const payload = buildPayload(
-    await gitUtils.getCommitOid(checkoutPath),
-    await gitUtils.getRef(),
-    analysisKey,
-    util.getRequiredEnvParam("GITHUB_WORKFLOW"),
-    zippedSarif,
-    actionsUtil.getWorkflowRunID(),
-    actionsUtil.getWorkflowRunAttempt(),
-    checkoutURI,
-    environment,
-    toolNames,
-    await gitUtils.determineBaseBranchHeadCommitOid(),
+  const payload = uploadTarget.transformPayload(
+    buildPayload(
+      await gitUtils.getCommitOid(checkoutPath),
+      await gitUtils.getRef(),
+      postProcessingResults.analysisKey,
+      util.getRequiredEnvParam("GITHUB_WORKFLOW"),
+      zippedSarif,
+      actionsUtil.getWorkflowRunID(),
+      actionsUtil.getWorkflowRunAttempt(),
+      checkoutURI,
+      postProcessingResults.environment,
+      toolNames,
+      await gitUtils.determineBaseBranchHeadCommitOid(),
+    ),
   );
 
   // Log some useful debug info about the info
@@ -834,19 +818,21 @@ function dumpSarifFile(
     fs.mkdirSync(outputDir, { recursive: true });
   } else if (!fs.lstatSync(outputDir).isDirectory()) {
     throw new ConfigurationError(
-      `The path specified by the ${EnvVar.SARIF_DUMP_DIR} environment variable exists and is not a directory: ${outputDir}`,
+      `The path that processed SARIF files should be written to exists, but is not a directory: ${outputDir}`,
     );
   }
   const outputFile = path.resolve(
     outputDir,
     `upload${uploadTarget.sarifExtension}`,
   );
-  logger.info(`Dumping processed SARIF file to ${outputFile}`);
+  logger.info(`Writing processed SARIF file to ${outputFile}`);
   fs.writeFileSync(outputFile, sarifPayload);
 }
 
-const STATUS_CHECK_FREQUENCY_MILLISECONDS = 5 * 1000;
-const STATUS_CHECK_TIMEOUT_MILLISECONDS = 2 * 60 * 1000;
+// Should lead to status checks after 5s, 15s, 35s, 75s, and 155s.
+const STATUS_CHECK_INITIAL_BACKOFF_MILLISECONDS = 5 * 1000;
+const STATUS_CHECK_BACKOFF_MULTIPLIER = 2;
+const STATUS_CHECK_MAX_TRIES = 5;
 
 type ProcessingStatus = "pending" | "complete" | "failed";
 
@@ -870,21 +856,17 @@ export async function waitForProcessing(
   try {
     const client = api.getApiClient();
 
-    const statusCheckingStarted = Date.now();
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      if (
-        Date.now() >
-        statusCheckingStarted + STATUS_CHECK_TIMEOUT_MILLISECONDS
-      ) {
-        // If the analysis hasn't finished processing in the allotted time, we continue anyway rather than failing.
-        // It's possible the analysis will eventually finish processing, but it's not worth spending more
-        // Actions time waiting.
-        logger.warning(
-          "Timed out waiting for analysis to finish processing. Continuing.",
-        );
-        break;
-      }
+    // Do an initial wait because processing will always take a minimum of 2-3 seconds
+    let statusCheckBackoff = STATUS_CHECK_INITIAL_BACKOFF_MILLISECONDS;
+    if (process.env["NODE_ENV"] !== "test") {
+      await util.delay(statusCheckBackoff, { allowProcessExit: false });
+    }
+
+    for (
+      let statusCheckCount = 1;
+      statusCheckCount <= STATUS_CHECK_MAX_TRIES;
+      statusCheckCount++
+    ) {
       let response: OctokitResponse<any> | undefined = undefined;
       try {
         response = await client.request(
@@ -929,9 +911,18 @@ export async function waitForProcessing(
         util.assertNever(status);
       }
 
-      await util.delay(STATUS_CHECK_FREQUENCY_MILLISECONDS, {
-        allowProcessExit: false,
-      });
+      if (statusCheckCount === STATUS_CHECK_MAX_TRIES) {
+        // If the analysis hasn't finished processing in the allotted time, we continue anyway rather than failing.
+        // It's possible the analysis will eventually finish processing, but it's not worth spending more
+        // Actions time waiting.
+        logger.warning(
+          "Timed out waiting for analysis to finish processing. Continuing.",
+        );
+        break;
+      } else {
+        statusCheckBackoff *= STATUS_CHECK_BACKOFF_MULTIPLIER;
+        await util.delay(statusCheckBackoff, { allowProcessExit: false });
+      }
     }
   } finally {
     logger.endGroup();
@@ -1015,14 +1006,14 @@ function handleProcessingResultForUnsuccessfulExecution(
 }
 
 export function validateUniqueCategory(
-  sarif: SarifFile,
+  sarifLog: Partial<sarif.Log>,
   sentinelPrefix: string,
 ): void {
   // duplicate categories are allowed in the same sarif file
   // but not across multiple sarif files
   const categories = {} as Record<string, { id?: string; tool?: string }>;
 
-  for (const run of sarif.runs) {
+  for (const run of sarifLog.runs || []) {
     const id = run?.automationDetails?.id;
     const tool = run.tool?.driver?.name;
     const category = `${sanitize(id)}_${sanitize(tool)}`;
@@ -1057,24 +1048,20 @@ function sanitize(str?: string) {
   return (str ?? "_").replace(/[^a-zA-Z0-9_]/g, "_").toLocaleUpperCase();
 }
 
-/**
- * An error that occurred due to an invalid SARIF upload request.
- */
-export class InvalidSarifUploadError extends Error {
-  constructor(message: string) {
-    super(message);
-  }
-}
-
-function filterAlertsByDiffRange(logger: Logger, sarif: SarifFile): SarifFile {
+export function filterAlertsByDiffRange(
+  logger: Logger,
+  sarifLog: Partial<sarif.Log>,
+): Partial<sarif.Log> {
   const diffRanges = readDiffRangesJsonFile(logger);
   if (!diffRanges?.length) {
-    return sarif;
+    return sarifLog;
   }
 
-  const checkoutPath = actionsUtil.getRequiredInput("checkout_path");
+  if (sarifLog.runs === undefined) {
+    return sarifLog;
+  }
 
-  for (const run of sarif.runs) {
+  for (const run of sarifLog.runs) {
     if (run.results) {
       run.results = run.results.filter((result) => {
         const locations = [
@@ -1088,11 +1075,6 @@ function filterAlertsByDiffRange(logger: Logger, sarif: SarifFile): SarifFile {
           if (!locationUri || locationStartLine === undefined) {
             return false;
           }
-          // CodeQL always uses forward slashes as the path separator, so on Windows we
-          // need to replace any backslashes with forward slashes.
-          const locationPath = path
-            .join(checkoutPath, locationUri)
-            .replaceAll(path.sep, "/");
           // Alert filtering here replicates the same behavior as the restrictAlertsTo
           // extensible predicate in CodeQL. See the restrictAlertsTo documentation
           // https://codeql.github.com/codeql-standard-libraries/csharp/codeql/util/AlertFiltering.qll/predicate.AlertFiltering$restrictAlertsTo.3.html
@@ -1100,7 +1082,7 @@ function filterAlertsByDiffRange(logger: Logger, sarif: SarifFile): SarifFile {
           // of an alert location.
           return diffRanges.some(
             (range) =>
-              range.path === locationPath &&
+              range.path === locationUri &&
               ((range.startLine <= locationStartLine &&
                 range.endLine >= locationStartLine) ||
                 (range.startLine === 0 && range.endLine === 0)),
@@ -1110,5 +1092,5 @@ function filterAlertsByDiffRange(logger: Logger, sarif: SarifFile): SarifFile {
     }
   }
 
-  return sarif;
+  return sarifLog;
 }

@@ -15,7 +15,7 @@ import {
 import * as configUtils from "./config-utils";
 import { Feature } from "./feature-flags";
 import * as gitUtils from "./git-utils";
-import { KnownLanguage } from "./languages";
+import { BuiltInLanguage } from "./languages";
 import { getRunnerLogger } from "./logging";
 import {
   createFeatures,
@@ -38,10 +38,10 @@ const stubCodeql = createStubCodeQL({
   async getVersion() {
     return makeVersionInfo("2.10.3");
   },
-  async betterResolveLanguages() {
+  async resolveLanguages() {
     return {
       extractors: {
-        [KnownLanguage.javascript]: [
+        [BuiltInLanguage.javascript]: [
           {
             extractor_root: "some_root",
             extractor_options: {
@@ -65,7 +65,7 @@ const stubCodeql = createStubCodeQL({
             },
           },
         ],
-        [KnownLanguage.cpp]: [
+        [BuiltInLanguage.cpp]: [
           {
             extractor_root: "other_root",
           },
@@ -76,7 +76,7 @@ const stubCodeql = createStubCodeQL({
 });
 
 const testConfigWithoutTmpDir = createTestConfig({
-  languages: [KnownLanguage.javascript, KnownLanguage.cpp],
+  languages: [BuiltInLanguage.javascript, BuiltInLanguage.cpp],
   trapCaches: {
     javascript: "/some/cache/dir",
   },
@@ -84,7 +84,7 @@ const testConfigWithoutTmpDir = createTestConfig({
 
 function getTestConfigWithTempDir(tempDir: string): configUtils.Config {
   return createTestConfig({
-    languages: [KnownLanguage.javascript, KnownLanguage.ruby],
+    languages: [BuiltInLanguage.javascript, BuiltInLanguage.ruby],
     tempDir,
     dbLocation: path.resolve(tempDir, "codeql_databases"),
     trapCaches: {
@@ -94,13 +94,13 @@ function getTestConfigWithTempDir(tempDir: string): configUtils.Config {
   });
 }
 
-test("check flags for JS, analyzing default branch", async (t) => {
+test.serial("check flags for JS, analyzing default branch", async (t) => {
   await util.withTmpDir(async (tmpDir) => {
     const config = getTestConfigWithTempDir(tmpDir);
     sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(true);
     const result = await getTrapCachingExtractorConfigArgsForLang(
       config,
-      KnownLanguage.javascript,
+      BuiltInLanguage.javascript,
     );
     t.deepEqual(result, [
       `-O=javascript.trap.cache.dir=${path.resolve(tmpDir, "jsCache")}`,
@@ -110,7 +110,7 @@ test("check flags for JS, analyzing default branch", async (t) => {
   });
 });
 
-test("check flags for all, not analyzing default branch", async (t) => {
+test.serial("check flags for all, not analyzing default branch", async (t) => {
   await util.withTmpDir(async (tmpDir) => {
     const config = getTestConfigWithTempDir(tmpDir);
     sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(false);
@@ -131,13 +131,13 @@ test("get languages that support TRAP caching", async (t) => {
   const logger = getRecordingLogger(loggedMessages);
   const languagesSupportingCaching = await getLanguagesSupportingCaching(
     stubCodeql,
-    [KnownLanguage.javascript, KnownLanguage.cpp],
+    [BuiltInLanguage.javascript, BuiltInLanguage.cpp],
     logger,
   );
-  t.deepEqual(languagesSupportingCaching, [KnownLanguage.javascript]);
+  t.deepEqual(languagesSupportingCaching, [BuiltInLanguage.javascript]);
 });
 
-test("upload cache key contains right fields", async (t) => {
+test.serial("upload cache key contains right fields", async (t) => {
   const loggedMessages = [];
   const logger = getRecordingLogger(loggedMessages);
   sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(true);
@@ -156,47 +156,50 @@ test("upload cache key contains right fields", async (t) => {
   );
 });
 
-test("download cache looks for the right key and creates dir", async (t) => {
-  await util.withTmpDir(async (tmpDir) => {
-    const loggedMessages = [];
-    const logger = getRecordingLogger(loggedMessages);
-    sinon.stub(actionsUtil, "getTemporaryDirectory").returns(tmpDir);
-    sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(false);
-    const stubRestore = sinon.stub(cache, "restoreCache").resolves("found");
-    const eventFile = path.resolve(tmpDir, "event.json");
-    process.env.GITHUB_EVENT_NAME = "pull_request";
-    process.env.GITHUB_EVENT_PATH = eventFile;
-    fs.writeFileSync(
-      eventFile,
-      JSON.stringify({
-        pull_request: {
-          base: {
-            sha: "somesha",
+test.serial(
+  "download cache looks for the right key and creates dir",
+  async (t) => {
+    await util.withTmpDir(async (tmpDir) => {
+      const loggedMessages = [];
+      const logger = getRecordingLogger(loggedMessages);
+      sinon.stub(actionsUtil, "getTemporaryDirectory").returns(tmpDir);
+      sinon.stub(gitUtils, "isAnalyzingDefaultBranch").resolves(false);
+      const stubRestore = sinon.stub(cache, "restoreCache").resolves("found");
+      const eventFile = path.resolve(tmpDir, "event.json");
+      process.env.GITHUB_EVENT_NAME = "pull_request";
+      process.env.GITHUB_EVENT_PATH = eventFile;
+      fs.writeFileSync(
+        eventFile,
+        JSON.stringify({
+          pull_request: {
+            base: {
+              sha: "somesha",
+            },
           },
-        },
-      }),
-    );
-    await downloadTrapCaches(
-      stubCodeql,
-      [KnownLanguage.javascript, KnownLanguage.cpp],
-      logger,
-    );
-    t.assert(
-      stubRestore.calledOnceWith(
-        sinon.match.array.contains([
-          path.resolve(tmpDir, "trapCaches", "javascript"),
-        ]),
-        sinon
-          .match("somesha")
-          .and(sinon.match("2.10.3"))
-          .and(sinon.match("javascript")),
-      ),
-    );
-    t.assert(fs.existsSync(path.resolve(tmpDir, "trapCaches", "javascript")));
-  });
-});
+        }),
+      );
+      await downloadTrapCaches(
+        stubCodeql,
+        [BuiltInLanguage.javascript, BuiltInLanguage.cpp],
+        logger,
+      );
+      t.assert(
+        stubRestore.calledOnceWith(
+          sinon.match.array.contains([
+            path.resolve(tmpDir, "trapCaches", "javascript"),
+          ]),
+          sinon
+            .match("somesha")
+            .and(sinon.match("2.10.3"))
+            .and(sinon.match("javascript")),
+        ),
+      );
+      t.assert(fs.existsSync(path.resolve(tmpDir, "trapCaches", "javascript")));
+    });
+  },
+);
 
-test("cleanup removes only old CodeQL TRAP caches", async (t) => {
+test.serial("cleanup removes only old CodeQL TRAP caches", async (t) => {
   await util.withTmpDir(async (tmpDir) => {
     // This config specifies that we are analyzing JavaScript and Ruby, but not Swift.
     const config = getTestConfigWithTempDir(tmpDir);

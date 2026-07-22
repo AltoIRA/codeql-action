@@ -4,6 +4,7 @@ import { performance } from "perf_hooks";
 
 import * as core from "@actions/core";
 
+import { Action, ActionState, runInActions } from "./action-common";
 import * as actionsUtil from "./actions-util";
 import * as analyses from "./analyses";
 import {
@@ -19,23 +20,20 @@ import { getApiDetails, getGitHubVersion } from "./api-client";
 import { runAutobuild } from "./autobuild";
 import { getTotalCacheSize, shouldStoreCache } from "./caching-utils";
 import { getCodeQL } from "./codeql";
+import { Config, getConfig } from "./config-utils";
 import {
-  Config,
-  getConfig,
-  isCodeQualityEnabled,
-  isCodeScanningEnabled,
-} from "./config-utils";
-import { uploadDatabases } from "./database-upload";
+  cleanupAndUploadDatabases,
+  DatabaseUploadResult,
+} from "./database-upload";
 import {
   DependencyCacheUploadStatusReport,
   uploadDependencyCaches,
 } from "./dependency-caching";
-import { getDiffInformedAnalysisBranches } from "./diff-informed-analysis-utils";
 import { EnvVar } from "./environment";
-import { Feature, Features } from "./feature-flags";
-import { KnownLanguage } from "./languages";
+import { initFeatures } from "./feature-flags";
+import { BuiltInLanguage } from "./languages";
 import { getActionsLogger, Logger } from "./logging";
-import { uploadOverlayBaseDatabaseToCache } from "./overlay-database-utils";
+import { cleanupAndUploadOverlayBaseDatabaseToCache } from "./overlay/caching";
 import { getRepositoryNwo } from "./repository";
 import * as statusReport from "./status-report";
 import {
@@ -52,21 +50,20 @@ import {
 } from "./trap-caching";
 import * as uploadLib from "./upload-lib";
 import { UploadResult } from "./upload-lib";
+import { postProcessAndUploadSarif } from "./upload-sarif";
 import * as util from "./util";
 
 interface AnalysisStatusReport
   extends uploadLib.UploadStatusReport,
     QueriesStatusReport {}
 
-interface DependencyCachingUploadStatusReport {
-  dependency_caching_upload_results?: DependencyCacheUploadStatusReport;
-}
-
 interface FinishStatusReport
   extends StatusReportBase,
     DatabaseCreationTimings,
-    AnalysisStatusReport,
-    DependencyCachingUploadStatusReport {}
+    AnalysisStatusReport {
+  dependency_caching_upload_results?: DependencyCacheUploadStatusReport;
+  database_upload_results: DatabaseUploadResult[];
+}
 
 interface FinishWithTrapUploadStatusReport extends FinishStatusReport {
   /** Size of TRAP caches that we uploaded, in bytes. */
@@ -85,6 +82,7 @@ async function sendStatusReport(
   didUploadTrapCaches: boolean,
   trapCacheCleanup: TrapCacheCleanupStatusReport | undefined,
   dependencyCacheResults: DependencyCacheUploadStatusReport | undefined,
+  databaseUploadResults: DatabaseUploadResult[],
   logger: Logger,
 ) {
   const status = getActionsStatus(error, stats?.analyze_failure_language);
@@ -105,6 +103,7 @@ async function sendStatusReport(
       ...(dbCreationTimings || {}),
       ...(trapCacheCleanup || {}),
       dependency_caching_upload_results: dependencyCacheResults,
+      database_upload_results: databaseUploadResults,
     };
     if (config && didUploadTrapCaches) {
       const trapCacheUploadStatusReport: FinishWithTrapUploadStatusReport = {
@@ -136,9 +135,13 @@ function hasBadExpectErrorInput(): boolean {
 function doesGoExtractionOutputExist(config: Config): boolean {
   const golangDbDirectory = util.getCodeQLDatabasePath(
     config,
-    KnownLanguage.go,
+    BuiltInLanguage.go,
   );
-  const trapDirectory = path.join(golangDbDirectory, "trap", KnownLanguage.go);
+  const trapDirectory = path.join(
+    golangDbDirectory,
+    "trap",
+    BuiltInLanguage.go,
+  );
   return (
     fs.existsSync(trapDirectory) &&
     fs
@@ -170,7 +173,7 @@ function doesGoExtractionOutputExist(config: Config): boolean {
  * whether any extraction output already exists for Go.
  */
 async function runAutobuildIfLegacyGoWorkflow(config: Config, logger: Logger) {
-  if (!config.languages.includes(KnownLanguage.go)) {
+  if (!config.languages.includes(BuiltInLanguage.go)) {
     return;
   }
   if (config.buildMode) {
@@ -183,7 +186,7 @@ async function runAutobuildIfLegacyGoWorkflow(config: Config, logger: Logger) {
     logger.debug("Won't run Go autobuild since it has already been run.");
     return;
   }
-  if (dbIsFinalized(config, KnownLanguage.go, logger)) {
+  if (dbIsFinalized(config, BuiltInLanguage.go, logger)) {
     logger.debug(
       "Won't run Go autobuild since there is already a finalized database for Go.",
     );
@@ -206,12 +209,16 @@ async function runAutobuildIfLegacyGoWorkflow(config: Config, logger: Logger) {
   logger.debug(
     "Running Go autobuild because extraction output (TRAP files) for Go code has not been found.",
   );
-  await runAutobuild(config, KnownLanguage.go, logger);
+  await runAutobuild(config, BuiltInLanguage.go, logger);
 }
 
-async function run() {
-  const startedAt = new Date();
-  let uploadResult: UploadResult | undefined = undefined;
+async function run({ startedAt, logger }: ActionState<["Base", "Logger"]>) {
+  // To capture errors appropriately, keep as much code within the try-catch as
+  // possible, and only use safe functions outside.
+
+  let uploadResults:
+    | Partial<Record<analyses.AnalysisKind, UploadResult>>
+    | undefined = undefined;
   let runStats: QueriesStatusReport | undefined = undefined;
   let config: Config | undefined = undefined;
   let trapCacheCleanupTelemetry: TrapCacheCleanupStatusReport | undefined =
@@ -220,14 +227,15 @@ async function run() {
   let dbCreationTimings: DatabaseCreationTimings | undefined = undefined;
   let didUploadTrapCaches = false;
   let dependencyCacheResults: DependencyCacheUploadStatusReport | undefined;
-  util.initializeEnvironment(actionsUtil.getActionVersion());
+  let databaseUploadResults: DatabaseUploadResult[] = [];
 
-  // Make inputs accessible in the `post` step, details at
-  // https://github.com/github/codeql-action/issues/2553
-  actionsUtil.persistInputs();
-
-  const logger = getActionsLogger();
   try {
+    util.initializeEnvironment(actionsUtil.getActionVersion());
+
+    // Make inputs accessible in the `post` step, details at
+    // https://github.com/github/codeql-action/issues/2553
+    actionsUtil.persistInputs();
+
     const statusReportBase = await createStatusReportBase(
       ActionName.Analyze,
       "starting",
@@ -287,7 +295,7 @@ async function run() {
 
     util.checkActionVersion(actionsUtil.getActionVersion(), gitHubVersion);
 
-    const features = new Features(
+    const features = initFeatures(
       gitHubVersion,
       repositoryNwo,
       actionsUtil.getTemporaryDirectory(),
@@ -299,19 +307,14 @@ async function run() {
       logger,
     );
 
-    const branches = await getDiffInformedAnalysisBranches(
-      codeql,
-      features,
-      logger,
-    );
-    const diffRangePackDir = branches
-      ? await setupDiffInformedQueryRun(branches, logger)
-      : undefined;
+    // Setup diff informed analysis if needed (based on whether init created the file)
+    const diffRangePackDir = await setupDiffInformedQueryRun(logger);
 
     await warnIfGoInstalledAfterInit(config, logger);
     await runAutobuildIfLegacyGoWorkflow(config, logger);
 
     dbCreationTimings = await runFinalize(
+      features,
       outputDir,
       threads,
       memory,
@@ -321,10 +324,16 @@ async function run() {
     );
 
     if (actionsUtil.getRequiredInput("skip-queries") !== "true") {
+      // Warn if the removed `add-snippets` input is used.
+      if (actionsUtil.getOptionalInput("add-snippets") !== undefined) {
+        logger.warning(
+          "The `add-snippets` input has been removed and no longer has any effect.",
+        );
+      }
+
       runStats = await runQueries(
         outputDir,
         memory,
-        util.getAddSnippetsFlag(actionsUtil.getRequiredInput("add-snippets")),
         threads,
         diffRangePackDir,
         actionsUtil.getOptionalInput("category"),
@@ -341,43 +350,57 @@ async function run() {
     }
     core.setOutput("db-locations", dbLocations);
     core.setOutput("sarif-output", path.resolve(outputDir));
-    const uploadInput = actionsUtil.getOptionalInput("upload");
-    if (runStats && actionsUtil.getUploadValue(uploadInput) === "always") {
-      if (isCodeScanningEnabled(config)) {
-        uploadResult = await uploadLib.uploadFiles(
-          outputDir,
-          actionsUtil.getRequiredInput("checkout_path"),
-          actionsUtil.getOptionalInput("category"),
-          features,
-          logger,
-          analyses.CodeScanning,
-        );
-        core.setOutput("sarif-id", uploadResult.sarifID);
-      }
+    const uploadKind = actionsUtil.getUploadValue(
+      actionsUtil.getOptionalInput("upload"),
+    );
+    if (runStats) {
+      const checkoutPath = actionsUtil.getRequiredInput("checkout_path");
+      const category = actionsUtil.getOptionalInput("category");
 
-      if (isCodeQualityEnabled(config)) {
-        const analysis = analyses.CodeQuality;
-        const qualityUploadResult = await uploadLib.uploadFiles(
-          outputDir,
-          actionsUtil.getRequiredInput("checkout_path"),
-          actionsUtil.getOptionalInput("category"),
-          features,
-          logger,
-          analysis,
+      uploadResults = await postProcessAndUploadSarif(
+        logger,
+        features,
+        uploadKind,
+        checkoutPath,
+        outputDir,
+        category,
+        actionsUtil.getOptionalInput("post-processed-sarif-path"),
+      );
+
+      // Set the SARIF id outputs only if we have results for them, to avoid
+      // having keys with empty values in the action output.
+      if (uploadResults[analyses.AnalysisKind.CodeScanning] !== undefined) {
+        core.setOutput(
+          "sarif-id",
+          uploadResults[analyses.AnalysisKind.CodeScanning].sarifID,
         );
-        core.setOutput("quality-sarif-id", qualityUploadResult.sarifID);
+      }
+      if (uploadResults[analyses.AnalysisKind.CodeQuality] !== undefined) {
+        core.setOutput(
+          "quality-sarif-id",
+          uploadResults[analyses.AnalysisKind.CodeQuality].sarifID,
+        );
       }
     } else {
       logger.info("Not uploading results");
     }
 
     // Possibly upload the overlay-base database to actions cache.
-    // If databases are to be uploaded, they will first be cleaned up at the overlay level.
-    await uploadOverlayBaseDatabaseToCache(codeql, config, logger);
+    // Note: Take care with the ordering of this call since databases may be cleaned up
+    // at the `overlay` level.
+    await cleanupAndUploadOverlayBaseDatabaseToCache(codeql, config, logger);
 
     // Possibly upload the database bundles for remote queries.
-    // If databases are to be uploaded, they will first be cleaned up at the clear level.
-    await uploadDatabases(repositoryNwo, codeql, config, apiDetails, logger);
+    // Note: Take care with the ordering of this call since databases may be cleaned up
+    // at the `overlay` or `clear` level.
+    databaseUploadResults = await cleanupAndUploadDatabases(
+      repositoryNwo,
+      codeql,
+      config,
+      apiDetails,
+      features,
+      logger,
+    );
 
     // Possibly upload the TRAP caches for later re-use
     const trapCacheUploadStartTime = performance.now();
@@ -393,14 +416,11 @@ async function run() {
 
     // Store dependency cache(s) if dependency caching is enabled.
     if (shouldStoreCache(config.dependencyCachingEnabled)) {
-      const minimizeJavaJars = await features.getValue(
-        Feature.JavaMinimizeDependencyJars,
-        codeql,
-      );
       dependencyCacheResults = await uploadDependencyCaches(
+        codeql,
+        features,
         config,
         logger,
-        minimizeJavaJars,
       );
     }
 
@@ -408,12 +428,12 @@ async function run() {
     if (util.isInTestMode()) {
       logger.debug("In test mode. Waiting for processing is disabled.");
     } else if (
-      uploadResult !== undefined &&
+      uploadResults?.[analyses.AnalysisKind.CodeScanning] !== undefined &&
       actionsUtil.getRequiredInput("wait-for-processing") === "true"
     ) {
       await uploadLib.waitForProcessing(
         getRepositoryNwo(),
-        uploadResult.sarifID,
+        uploadResults[analyses.AnalysisKind.CodeScanning].sarifID,
         getActionsLogger(),
       );
     }
@@ -445,18 +465,22 @@ async function run() {
       didUploadTrapCaches,
       trapCacheCleanupTelemetry,
       dependencyCacheResults,
+      databaseUploadResults,
       logger,
     );
     return;
   }
 
-  if (runStats && uploadResult) {
+  if (
+    runStats !== undefined &&
+    uploadResults?.[analyses.AnalysisKind.CodeScanning] !== undefined
+  ) {
     await sendStatusReport(
       startedAt,
       config,
       {
         ...runStats,
-        ...uploadResult.statusReport,
+        ...uploadResults[analyses.AnalysisKind.CodeScanning].statusReport,
       },
       undefined,
       trapCacheUploadTime,
@@ -464,9 +488,10 @@ async function run() {
       didUploadTrapCaches,
       trapCacheCleanupTelemetry,
       dependencyCacheResults,
+      databaseUploadResults,
       logger,
     );
-  } else if (runStats) {
+  } else if (runStats !== undefined) {
     await sendStatusReport(
       startedAt,
       config,
@@ -477,6 +502,7 @@ async function run() {
       didUploadTrapCaches,
       trapCacheCleanupTelemetry,
       dependencyCacheResults,
+      databaseUploadResults,
       logger,
     );
   } else {
@@ -490,20 +516,19 @@ async function run() {
       didUploadTrapCaches,
       trapCacheCleanupTelemetry,
       dependencyCacheResults,
+      databaseUploadResults,
       logger,
     );
   }
 }
 
-export const runPromise = run();
+/** Defines the `analyze` Action. */
+const analyze: Action = {
+  name: ActionName.Analyze,
+  run,
+};
 
-async function runWrapper() {
-  try {
-    await runPromise;
-  } catch (error) {
-    core.setFailed(`analyze action failed: ${util.getErrorMessage(error)}`);
-  }
+export async function runWrapper() {
+  await runInActions(analyze);
   await util.checkForTimeout();
 }
-
-void runWrapper();

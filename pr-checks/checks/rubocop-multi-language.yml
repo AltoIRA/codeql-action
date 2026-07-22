@@ -1,10 +1,11 @@
 name: "RuboCop multi-language"
 description: "Tests using RuboCop to analyze a multi-language repository and then using the CodeQL Action to upload the resulting SARIF"
 # This check doesn't use CodeQL, so the `version` matrix variable is unused.
-versions: ["default"]
+versions:
+  - default
 steps:
   - name: Set up Ruby
-    uses: ruby/setup-ruby@0481980f17b760ef6bca5e8c55809102a0af1e5a # v1.263.0
+    uses: ruby/setup-ruby@d45b1a4e94b71acab930e56e79c6aa188764e7f9 # v1.316.0
     with:
       ruby-version: 2.6
   - name: Install Code Scanning integration

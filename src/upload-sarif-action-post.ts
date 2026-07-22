@@ -12,7 +12,10 @@ import { EnvVar } from "./environment";
 import { getActionsLogger, withGroup } from "./logging";
 import { checkGitHubVersionInRange, getErrorMessage } from "./util";
 
-async function runWrapper() {
+export async function runWrapper() {
+  // To capture errors appropriately, keep as much code within the try-catch as
+  // possible, and only use safe functions outside.
+
   try {
     // Restore inputs from `upload-sarif` Action.
     actionsUtil.restoreInputs();
@@ -45,5 +48,3 @@ async function runWrapper() {
     );
   }
 }
-
-void runWrapper();
